@@ -61,7 +61,7 @@ namespace CloudM.Infrastructure.Repositories.Messages
                     SentAt = m.SentAt,
                     IsEdited = m.IsEdited,
                     IsRecalled = m.IsRecalled,
-                    SystemMessageDataJson = m.SystemMessageDataJson,
+                    SystemMessageDataJson = m.IsRecalled ? null : m.SystemMessageDataJson,
                     IsPinned = false,
 
                     Sender = new AccountChatInfoModel
@@ -278,6 +278,118 @@ namespace CloudM.Infrastructure.Repositories.Messages
                             TextColorKey = isExpired ? null : (root.TryGetProperty("textColorKey", out var tk) ? tk.GetString() : null),
                             FontTextKey = isExpired ? null : (root.TryGetProperty("fontTextKey", out var ft) ? ft.GetString() : null),
                             FontSizeKey = isExpired ? null : (root.TryGetProperty("fontSizeKey", out var fz) ? fz.GetString() : null),
+                        };
+                    }
+                }
+
+                var postShareMessages = messages
+                    .Where(m => !m.IsRecalled && m.MessageType == MessageTypeEnum.PostShare && !string.IsNullOrEmpty(m.SystemMessageDataJson))
+                    .ToList();
+                if (postShareMessages.Any())
+                {
+                    var postIds = new List<Guid>();
+                    var parsedSnapshots = new Dictionary<Guid, JsonElement>();
+                    foreach (var msg in postShareMessages)
+                    {
+                        try
+                        {
+                            using var doc = JsonDocument.Parse(msg.SystemMessageDataJson!);
+                            var root = doc.RootElement.Clone();
+                            parsedSnapshots[msg.MessageId] = root;
+                            if (root.TryGetProperty("postId", out var postIdProp) && Guid.TryParse(postIdProp.GetString(), out var postId))
+                            {
+                                postIds.Add(postId);
+                            }
+                        }
+                        catch
+                        {
+                            // Ignore malformed snapshots and fallback to unavailable state.
+                        }
+                    }
+
+                    var followedIdsQuery = _context.Follows
+                        .AsNoTracking()
+                        .Where(f => f.FollowerId == currentId)
+                        .Select(f => f.FollowedId);
+
+                    var visiblePostIdsList = postIds.Any()
+                        ? await _context.Posts.AsNoTracking()
+                            .Where(p => postIds.Contains(p.PostId)
+                                        && !p.IsDeleted
+                                        && p.Account.Status == AccountStatusEnum.Active
+                                        && (
+                                            p.AccountId == currentId ||
+                                            p.Privacy == PostPrivacyEnum.Public ||
+                                            (p.Privacy == PostPrivacyEnum.FollowOnly && followedIdsQuery.Contains(p.AccountId))
+                                        ))
+                            .Select(p => p.PostId)
+                            .ToListAsync()
+                        : new List<Guid>();
+                    var visiblePostIds = visiblePostIdsList.ToHashSet();
+
+                    foreach (var msg in postShareMessages)
+                    {
+                        if (!parsedSnapshots.TryGetValue(msg.MessageId, out var root))
+                        {
+                            msg.PostShareInfo = new PostShareInfoModel
+                            {
+                                IsPostUnavailable = true
+                            };
+                            continue;
+                        }
+
+                        var postId = Guid.Empty;
+                        if (root.TryGetProperty("postId", out var pidProp))
+                        {
+                            Guid.TryParse(pidProp.GetString(), out postId);
+                        }
+
+                        var postCode = root.TryGetProperty("postCode", out var postCodeProp)
+                            ? postCodeProp.GetString() ?? string.Empty
+                            : string.Empty;
+                        var ownerId = Guid.Empty;
+                        if (root.TryGetProperty("ownerId", out var ownerIdProp))
+                        {
+                            Guid.TryParse(ownerIdProp.GetString(), out ownerId);
+                        }
+                        var ownerUsername = root.TryGetProperty("ownerUsername", out var ownerUsernameProp)
+                            ? ownerUsernameProp.GetString()
+                            : null;
+                        var ownerDisplayName = root.TryGetProperty("ownerDisplayName", out var ownerDisplayNameProp)
+                            ? ownerDisplayNameProp.GetString()
+                            : null;
+                        var thumbnailUrl = root.TryGetProperty("thumbnailUrl", out var thumbnailUrlProp)
+                            ? thumbnailUrlProp.GetString()
+                            : null;
+                        int? thumbnailMediaType = null;
+                        if (root.TryGetProperty("thumbnailMediaType", out var thumbnailMediaTypeProp))
+                        {
+                            if (thumbnailMediaTypeProp.ValueKind == JsonValueKind.Number && thumbnailMediaTypeProp.TryGetInt32(out var numericMediaType))
+                            {
+                                thumbnailMediaType = numericMediaType;
+                            }
+                            else if (thumbnailMediaTypeProp.ValueKind == JsonValueKind.String &&
+                                     int.TryParse(thumbnailMediaTypeProp.GetString(), out var parsedMediaType))
+                            {
+                                thumbnailMediaType = parsedMediaType;
+                            }
+                        }
+                        var contentSnippet = root.TryGetProperty("contentSnippet", out var contentSnippetProp)
+                            ? contentSnippetProp.GetString()
+                            : null;
+
+                        var isUnavailable = postId == Guid.Empty || !visiblePostIds.Contains(postId);
+                        msg.PostShareInfo = new PostShareInfoModel
+                        {
+                            PostId = postId,
+                            PostCode = postCode,
+                            IsPostUnavailable = isUnavailable,
+                            OwnerId = ownerId,
+                            OwnerUsername = ownerUsername,
+                            OwnerDisplayName = ownerDisplayName,
+                            ThumbnailUrl = isUnavailable ? null : thumbnailUrl,
+                            ThumbnailMediaType = isUnavailable ? null : thumbnailMediaType,
+                            ContentSnippet = isUnavailable ? null : contentSnippet
                         };
                     }
                 }

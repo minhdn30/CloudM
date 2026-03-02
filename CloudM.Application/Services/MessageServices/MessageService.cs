@@ -14,6 +14,7 @@ using CloudM.Infrastructure.Repositories.ConversationMembers;
 using CloudM.Infrastructure.Repositories.Conversations;
 using CloudM.Infrastructure.Repositories.MessageMedias;
 using CloudM.Infrastructure.Repositories.Messages;
+using CloudM.Infrastructure.Repositories.Posts;
 using CloudM.Infrastructure.Repositories.Stories;
 using CloudM.Infrastructure.Repositories.UnitOfWork;
 using CloudM.Application.Services.RealtimeServices;
@@ -29,11 +30,18 @@ namespace CloudM.Application.Services.MessageServices
 {
     public class MessageService : IMessageService
     {
+        private const int MaxPostShareRecipientsPerRequest = 50;
+        private const int DefaultPostShareSearchLimit = 20;
+        private const int MaxPostShareSearchLimit = 50;
+        private const int EmptyKeywordRecentContactsLimit = 10;
+        private const int PostShareSearchPrefetchMultiplier = 6;
+        private const int MaxPostShareSearchPrefetch = 300;
         private readonly IMessageRepository _messageRepository;
         private readonly IMessageMediaRepository _messageMediaRepository;
         private readonly IConversationRepository _conversationRepository;
         private readonly IConversationMemberRepository _conversationMemberRepository;
         private readonly IAccountRepository _accountRepository;
+        private readonly IPostRepository _postRepository;
         private readonly ICloudinaryService _cloudinaryService;
         private readonly IFileTypeDetector _fileTypeDetector;
         private readonly IStoryRepository _storyRepository;
@@ -42,7 +50,7 @@ namespace CloudM.Application.Services.MessageServices
         private readonly IUnitOfWork _unitOfWork;
 
         public MessageService(IMessageRepository messageRepository, IMessageMediaRepository messageMediaRepository, IConversationRepository conversationRepository, IConversationMemberRepository conversationMemberRepository,
-            IAccountRepository accountRepository, IMapper mapper, ICloudinaryService cloudinaryService,
+            IAccountRepository accountRepository, IPostRepository postRepository, IMapper mapper, ICloudinaryService cloudinaryService,
             IFileTypeDetector fileTypeDetector, IStoryRepository storyRepository, IRealtimeService realtimeService, IUnitOfWork unitOfWork)
         {
             _messageRepository = messageRepository;
@@ -50,6 +58,7 @@ namespace CloudM.Application.Services.MessageServices
             _conversationRepository = conversationRepository;
             _conversationMemberRepository = conversationMemberRepository;
             _accountRepository = accountRepository;
+            _postRepository = postRepository;
             _cloudinaryService = cloudinaryService;
             _fileTypeDetector = fileTypeDetector;
             _storyRepository = storyRepository;
@@ -568,6 +577,506 @@ namespace CloudM.Application.Services.MessageServices
                 },
                 () => Task.CompletedTask
             );
+        }
+
+        public async Task<SearchPostShareTargetsResponse> SearchPostShareTargetsAsync(
+            Guid senderId,
+            string? keyword,
+            int? limit = null)
+        {
+            var sender = await _accountRepository.GetAccountById(senderId);
+            if (sender == null)
+                throw new BadRequestException($"Sender account with ID {senderId} does not exist.");
+            if (sender.Status != AccountStatusEnum.Active)
+                throw new ForbiddenException("You must reactivate your account to send messages.");
+
+            var normalizedKeyword = keyword?.Trim() ?? string.Empty;
+            var safeLimit = NormalizePostShareSearchLimit(limit);
+
+            if (normalizedKeyword.Length == 0)
+            {
+                var recentLimit = EmptyKeywordRecentContactsLimit;
+                var (recentConversations, _) = await _conversationRepository.GetConversationsPagedAsync(
+                    senderId,
+                    null,
+                    null,
+                    1,
+                    recentLimit);
+
+                var recentItems = new List<PostShareTargetSearchItemResponse>();
+                var uniqueKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+                foreach (var conversation in recentConversations)
+                {
+                    if (conversation.IsGroup)
+                    {
+                        var key = $"group:{conversation.ConversationId}";
+                        if (!uniqueKeys.Add(key)) continue;
+
+                        recentItems.Add(new PostShareTargetSearchItemResponse
+                        {
+                            TargetType = "groupConversation",
+                            ConversationId = conversation.ConversationId,
+                            Name = conversation.ConversationName?.Trim() ?? conversation.DisplayName?.Trim() ?? "Group chat",
+                            Subtitle = "Group conversation",
+                            AvatarUrl = conversation.ConversationAvatar ?? conversation.DisplayAvatar,
+                            UseGroupIcon = string.IsNullOrWhiteSpace(conversation.ConversationAvatar) &&
+                                           string.IsNullOrWhiteSpace(conversation.DisplayAvatar),
+                            IsContacted = true,
+                            LastContactedAt = conversation.LastMessageSentAt,
+                            MatchScore = 0d
+                        });
+                        continue;
+                    }
+
+                    var otherMember = conversation.OtherMember;
+                    if (otherMember == null || otherMember.AccountId == Guid.Empty)
+                    {
+                        continue;
+                    }
+
+                    var keyUser = $"user:{otherMember.AccountId}";
+                    if (!uniqueKeys.Add(keyUser)) continue;
+
+                    var userName = (otherMember.Username ?? string.Empty).Trim();
+                    var fullName = (otherMember.FullName ?? string.Empty).Trim();
+                    recentItems.Add(new PostShareTargetSearchItemResponse
+                    {
+                        TargetType = "user",
+                        AccountId = otherMember.AccountId,
+                        Name = string.IsNullOrWhiteSpace(userName) ? "Unknown user" : userName,
+                        Subtitle = !string.IsNullOrWhiteSpace(fullName) &&
+                                   !string.Equals(fullName, userName, StringComparison.OrdinalIgnoreCase)
+                            ? fullName
+                            : null,
+                        AvatarUrl = otherMember.AvatarUrl,
+                        UseGroupIcon = false,
+                        IsContacted = true,
+                        LastContactedAt = conversation.LastMessageSentAt,
+                        MatchScore = 0d
+                    });
+                }
+
+                return new SearchPostShareTargetsResponse
+                {
+                    Keyword = string.Empty,
+                    Limit = recentLimit,
+                    Total = recentItems.Count,
+                    Items = recentItems
+                };
+            }
+
+            var prefetchLimit = Math.Min(
+                Math.Max(safeLimit * PostShareSearchPrefetchMultiplier, safeLimit),
+                MaxPostShareSearchPrefetch);
+
+            var userResults = await _accountRepository.SearchAccountsForPostShareAsync(
+                senderId,
+                normalizedKeyword,
+                prefetchLimit);
+            var groupResults = await _conversationRepository.SearchGroupConversationsForPostShareAsync(
+                senderId,
+                normalizedKeyword,
+                prefetchLimit);
+
+            var userItems = userResults.Select(user =>
+            {
+                var username = (user.Username ?? string.Empty).Trim();
+                var fullName = (user.FullName ?? string.Empty).Trim();
+                return new PostShareTargetSearchItemResponse
+                {
+                    TargetType = "user",
+                    AccountId = user.AccountId,
+                    Name = string.IsNullOrWhiteSpace(username) ? "Unknown user" : username,
+                    Subtitle = !string.IsNullOrWhiteSpace(fullName) &&
+                               !string.Equals(fullName, username, StringComparison.OrdinalIgnoreCase)
+                        ? fullName
+                        : null,
+                    AvatarUrl = user.AvatarUrl,
+                    UseGroupIcon = false,
+                    IsContacted = user.IsContacted,
+                    LastContactedAt = user.LastContactedAt,
+                    MatchScore = user.MatchScore
+                };
+            });
+
+            var groupItems = groupResults.Select(group => new PostShareTargetSearchItemResponse
+            {
+                TargetType = "groupConversation",
+                ConversationId = group.ConversationId,
+                Name = string.IsNullOrWhiteSpace(group.ConversationName)
+                    ? "Group chat"
+                    : group.ConversationName.Trim(),
+                Subtitle = "Group conversation",
+                AvatarUrl = group.ConversationAvatar,
+                UseGroupIcon = string.IsNullOrWhiteSpace(group.ConversationAvatar),
+                IsContacted = group.IsContacted,
+                LastContactedAt = group.LastContactedAt,
+                MatchScore = group.MatchScore
+            });
+
+            var mergedItems = userItems
+                .Concat(groupItems)
+                .OrderByDescending(item => item.MatchScore)
+                .ThenByDescending(item => item.IsContacted)
+                .ThenByDescending(item => item.LastContactedAt)
+                .ThenBy(item => item.Name)
+                .Take(safeLimit)
+                .ToList();
+
+            return new SearchPostShareTargetsResponse
+            {
+                Keyword = normalizedKeyword,
+                Limit = safeLimit,
+                Total = mergedItems.Count,
+                Items = mergedItems
+            };
+        }
+
+        public async Task<SendPostShareResponse> SendPostShareAsync(Guid senderId, SendPostShareRequest request)
+        {
+            if (request == null)
+                throw new BadRequestException("Request is required.");
+
+            if (request.PostId == Guid.Empty)
+                throw new BadRequestException("Post ID is required.");
+
+            var sender = await _accountRepository.GetAccountById(senderId);
+            if (sender == null)
+                throw new BadRequestException($"Sender account with ID {senderId} does not exist.");
+            if (sender.Status != AccountStatusEnum.Active)
+                throw new ForbiddenException("You must reactivate your account to send messages.");
+
+            var conversationIds = (request.ConversationIds ?? new List<Guid>())
+                .Where(id => id != Guid.Empty)
+                .Distinct()
+                .ToList();
+            var receiverIds = (request.ReceiverIds ?? new List<Guid>())
+                .Where(id => id != Guid.Empty)
+                .Distinct()
+                .ToList();
+
+            if (!conversationIds.Any() && !receiverIds.Any())
+                throw new BadRequestException("At least one recipient is required.");
+
+            var requestedRecipientCount = conversationIds.Count + receiverIds.Count;
+            if (requestedRecipientCount > MaxPostShareRecipientsPerRequest)
+                throw new BadRequestException($"You can share to up to {MaxPostShareRecipientsPerRequest} recipients at once.");
+
+            var post = await _postRepository.GetPostDetailByPostId(request.PostId, senderId);
+            if (post == null)
+                throw new BadRequestException("This post is no longer available.");
+
+            var normalizedContent = NormalizeOptionalMessageContent(request.Content);
+            var shareInfo = BuildPostShareInfo(post);
+            var snapshotJson = JsonSerializer.Serialize(new
+            {
+                postId = shareInfo.PostId,
+                postCode = shareInfo.PostCode,
+                ownerId = shareInfo.OwnerId,
+                ownerUsername = shareInfo.OwnerUsername,
+                ownerDisplayName = shareInfo.OwnerDisplayName,
+                thumbnailUrl = shareInfo.ThumbnailUrl,
+                thumbnailMediaType = shareInfo.ThumbnailMediaType,
+                contentSnippet = shareInfo.ContentSnippet
+            });
+
+            var senderDto = _mapper.Map<AccountChatInfoResponse>(sender);
+            var processedConversationIds = new HashSet<Guid>();
+            var results = new List<PostShareSendResult>();
+            var receiverLookup = new Dictionary<Guid, Account>();
+            if (receiverIds.Any())
+            {
+                var receiverAccounts = await _accountRepository.GetAccountsByIds(receiverIds) ?? new List<Account>();
+                receiverLookup = receiverAccounts.ToDictionary(account => account.AccountId, account => account);
+            }
+
+            foreach (var conversationId in conversationIds)
+            {
+                if (!processedConversationIds.Add(conversationId))
+                {
+                    results.Add(BuildDuplicatePostShareResult(conversationId, null, results));
+                    continue;
+                }
+
+                var result = await SendPostShareToConversationAsync(
+                    senderId,
+                    senderDto,
+                    conversationId,
+                    null,
+                    normalizedContent,
+                    request.TempId,
+                    snapshotJson,
+                    shareInfo);
+                results.Add(result);
+            }
+
+            foreach (var receiverId in receiverIds)
+            {
+                if (receiverId == senderId)
+                {
+                    results.Add(new PostShareSendResult
+                    {
+                        ReceiverId = receiverId,
+                        IsSuccess = false,
+                        ErrorMessage = "You cannot send to yourself."
+                    });
+                    continue;
+                }
+
+                try
+                {
+                    if (!receiverLookup.TryGetValue(receiverId, out var receiver) || receiver == null)
+                    {
+                        results.Add(new PostShareSendResult
+                        {
+                            ReceiverId = receiverId,
+                            IsSuccess = false,
+                            ErrorMessage = "Receiver account does not exist."
+                        });
+                        continue;
+                    }
+
+                    if (receiver.Status != AccountStatusEnum.Active)
+                    {
+                        results.Add(new PostShareSendResult
+                        {
+                            ReceiverId = receiverId,
+                            IsSuccess = false,
+                            ErrorMessage = "This user is currently unavailable."
+                        });
+                        continue;
+                    }
+
+                    var conversationId =
+                        await _conversationRepository.GetPrivateConversationIdAsync(senderId, receiverId);
+                    if (conversationId == null)
+                    {
+                        var conversation = await _conversationRepository.CreatePrivateConversationAsync(senderId, receiverId);
+                        await _unitOfWork.CommitAsync();
+                        conversationId = conversation.ConversationId;
+                    }
+
+                    if (!processedConversationIds.Add(conversationId.Value))
+                    {
+                        results.Add(BuildDuplicatePostShareResult(conversationId.Value, receiverId, results));
+                        continue;
+                    }
+
+                    var result = await SendPostShareToConversationAsync(
+                        senderId,
+                        senderDto,
+                        conversationId.Value,
+                        receiverId,
+                        normalizedContent,
+                        request.TempId,
+                        snapshotJson,
+                        shareInfo,
+                        skipMembershipValidation: true);
+                    results.Add(result);
+                }
+                catch (Exception ex)
+                {
+                    results.Add(new PostShareSendResult
+                    {
+                        ReceiverId = receiverId,
+                        IsSuccess = false,
+                        ErrorMessage = ResolvePostShareFailureMessage(ex)
+                    });
+                }
+            }
+
+            return new SendPostShareResponse
+            {
+                TotalRequested = results.Count,
+                TotalSucceeded = results.Count(r => r.IsSuccess),
+                TotalFailed = results.Count(r => !r.IsSuccess),
+                Results = results
+            };
+        }
+
+        private async Task<PostShareSendResult> SendPostShareToConversationAsync(
+            Guid senderId,
+            AccountChatInfoResponse sender,
+            Guid conversationId,
+            Guid? receiverId,
+            string? content,
+            string? tempId,
+            string snapshotJson,
+            PostShareInfoModel shareInfo,
+            bool skipMembershipValidation = false)
+        {
+            try
+            {
+                if (!skipMembershipValidation)
+                {
+                    var conversation = await _conversationRepository.GetConversationByIdAsync(conversationId);
+                    if (conversation == null)
+                    {
+                        return new PostShareSendResult
+                        {
+                            ConversationId = conversationId,
+                            ReceiverId = receiverId,
+                            IsSuccess = false,
+                            ErrorMessage = "Conversation not found."
+                        };
+                    }
+
+                    if (!await _conversationMemberRepository.IsMemberOfConversation(conversationId, senderId))
+                    {
+                        return new PostShareSendResult
+                        {
+                            ConversationId = conversationId,
+                            ReceiverId = receiverId,
+                            IsSuccess = false,
+                            ErrorMessage = "You are not a member of this conversation."
+                        };
+                    }
+                }
+
+                var message = await _unitOfWork.ExecuteInTransactionAsync(
+                    async () =>
+                    {
+                        var entity = new Message
+                        {
+                            ConversationId = conversationId,
+                            AccountId = senderId,
+                            Content = content,
+                            MessageType = MessageTypeEnum.PostShare,
+                            SentAt = DateTime.UtcNow,
+                            IsEdited = false,
+                            IsRecalled = false,
+                            SystemMessageDataJson = snapshotJson
+                        };
+                        await _messageRepository.AddMessageAsync(entity);
+
+                        var result = _mapper.Map<SendMessageResponse>(entity);
+                        result.TempId = tempId;
+                        result.Sender = sender;
+                        result.PostShareInfo = ClonePostShareInfo(shareInfo);
+
+                        var muteMap = await _conversationMemberRepository.GetMembersWithMuteStatusAsync(conversationId);
+                        await _realtimeService.NotifyNewMessageAsync(conversationId, muteMap, result);
+
+                        return result;
+                    },
+                    () => Task.CompletedTask);
+
+                return new PostShareSendResult
+                {
+                    ConversationId = conversationId,
+                    ReceiverId = receiverId,
+                    IsSuccess = true,
+                    Message = message
+                };
+            }
+            catch (Exception ex)
+            {
+                return new PostShareSendResult
+                {
+                    ConversationId = conversationId,
+                    ReceiverId = receiverId,
+                    IsSuccess = false,
+                    ErrorMessage = ResolvePostShareFailureMessage(ex)
+                };
+            }
+        }
+
+        private static int NormalizePostShareSearchLimit(int? limit)
+        {
+            if (!limit.HasValue || limit.Value <= 0)
+            {
+                return DefaultPostShareSearchLimit;
+            }
+
+            return Math.Min(limit.Value, MaxPostShareSearchLimit);
+        }
+
+        private static string? NormalizeOptionalMessageContent(string? content)
+        {
+            var normalized = (content ?? string.Empty).Trim();
+            return normalized.Length == 0 ? null : normalized;
+        }
+
+        private static string ResolvePostShareFailureMessage(Exception ex)
+        {
+            if (ex is BadRequestException ||
+                ex is ForbiddenException ||
+                ex is NotFoundException)
+            {
+                return ex.Message;
+            }
+
+            return "Failed to share post.";
+        }
+
+        private static PostShareSendResult BuildDuplicatePostShareResult(
+            Guid conversationId,
+            Guid? receiverId,
+            IReadOnlyList<PostShareSendResult> currentResults)
+        {
+            var existing = currentResults.LastOrDefault(item => item.ConversationId == conversationId);
+            if (existing == null)
+            {
+                return new PostShareSendResult
+                {
+                    ConversationId = conversationId,
+                    ReceiverId = receiverId,
+                    IsSuccess = false,
+                    ErrorMessage = "Failed to share post."
+                };
+            }
+
+            return new PostShareSendResult
+            {
+                ConversationId = conversationId,
+                ReceiverId = receiverId,
+                IsSuccess = existing.IsSuccess,
+                ErrorMessage = existing.IsSuccess ? null : existing.ErrorMessage,
+                Message = existing.IsSuccess ? existing.Message : null
+            };
+        }
+
+        private static string? BuildPostContentSnippet(string? content)
+        {
+            var normalized = (content ?? string.Empty).Trim();
+            if (normalized.Length == 0) return null;
+            const int maxLength = 120;
+            if (normalized.Length <= maxLength) return normalized;
+            return normalized.Substring(0, maxLength - 3) + "...";
+        }
+
+        private static PostShareInfoModel BuildPostShareInfo(PostDetailModel post)
+        {
+            var firstMedia = post.Medias?.FirstOrDefault();
+            return new PostShareInfoModel
+            {
+                PostId = post.PostId,
+                PostCode = post.PostCode ?? string.Empty,
+                IsPostUnavailable = false,
+                OwnerId = post.Owner?.AccountId ?? Guid.Empty,
+                OwnerUsername = post.Owner?.Username,
+                OwnerDisplayName = post.Owner?.FullName,
+                ThumbnailUrl = firstMedia?.MediaUrl,
+                ThumbnailMediaType = firstMedia != null ? (int?)firstMedia.MediaType : null,
+                ContentSnippet = BuildPostContentSnippet(post.Content)
+            };
+        }
+
+        private static PostShareInfoModel ClonePostShareInfo(PostShareInfoModel source)
+        {
+            return new PostShareInfoModel
+            {
+                PostId = source.PostId,
+                PostCode = source.PostCode,
+                IsPostUnavailable = source.IsPostUnavailable,
+                OwnerId = source.OwnerId,
+                OwnerUsername = source.OwnerUsername,
+                OwnerDisplayName = source.OwnerDisplayName,
+                ThumbnailUrl = source.ThumbnailUrl,
+                ThumbnailMediaType = source.ThumbnailMediaType,
+                ContentSnippet = source.ContentSnippet
+            };
         }
 
     }

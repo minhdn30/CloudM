@@ -24,6 +24,9 @@ namespace CloudM.Infrastructure.Repositories.Accounts
         private const int MinInviteSearchPrefetch = 60;
         private const int MaxInviteSearchPrefetch = 240;
         private const double FuzzySimilarityThreshold = 0.24d;
+        private const int DefaultPostShareSearchLimit = 20;
+        private const int MaxPostShareSearchLimit = 50;
+        private const int MaxPostShareSearchPrefetch = 300;
 
         private readonly AppDbContext _context;
         public AccountRepository(AppDbContext context)
@@ -495,6 +498,113 @@ namespace CloudM.Infrastructure.Repositories.Accounts
             return rankedResults;
         }
 
+        public async Task<List<PostShareAccountSearchModel>> SearchAccountsForPostShareAsync(
+            Guid currentId,
+            string keyword,
+            int limit = 20)
+        {
+            var normalizedKeyword = keyword?.Trim() ?? string.Empty;
+            if (normalizedKeyword.Length == 0)
+            {
+                return new List<PostShareAccountSearchModel>();
+            }
+
+            var safeLimit = NormalizePostShareSearchLimit(limit);
+            var prefetchLimit = Math.Min(Math.Max(safeLimit * 6, safeLimit), MaxPostShareSearchPrefetch);
+            var containsPattern = $"%{normalizedKeyword}%";
+            var startsWithPattern = $"{normalizedKeyword}%";
+
+            var preliminaryCandidates = await _context.Accounts
+                .AsNoTracking()
+                .Where(a => a.Status == AccountStatusEnum.Active && a.AccountId != currentId)
+                .Select(a => new PreliminaryPostShareAccountCandidate
+                {
+                    AccountId = a.AccountId,
+                    Username = a.Username,
+                    FullName = a.FullName,
+                    AvatarUrl = a.AvatarUrl,
+                    UsernameStartsWith = EF.Functions.ILike(a.Username, startsWithPattern),
+                    FullNameStartsWith = EF.Functions.ILike(AppDbContext.Unaccent(a.FullName), AppDbContext.Unaccent(startsWithPattern)),
+                    UsernameContains = EF.Functions.ILike(a.Username, containsPattern),
+                    FullNameContains = EF.Functions.ILike(AppDbContext.Unaccent(a.FullName), AppDbContext.Unaccent(containsPattern)),
+                    UsernameSimilarity = AppDbContext.Similarity(a.Username, normalizedKeyword),
+                    FullNameSimilarity = AppDbContext.Similarity(AppDbContext.Unaccent(a.FullName), AppDbContext.Unaccent(normalizedKeyword))
+                })
+                .Where(x =>
+                    x.UsernameContains ||
+                    x.FullNameContains ||
+                    x.UsernameSimilarity >= FuzzySimilarityThreshold ||
+                    x.FullNameSimilarity >= FuzzySimilarityThreshold)
+                .OrderByDescending(x => x.UsernameStartsWith)
+                .ThenByDescending(x => x.FullNameStartsWith)
+                .ThenByDescending(x => x.UsernameContains)
+                .ThenByDescending(x => x.FullNameContains)
+                .ThenByDescending(x => x.UsernameSimilarity)
+                .ThenByDescending(x => x.FullNameSimilarity)
+                .ThenBy(x => x.Username)
+                .Take(prefetchLimit)
+                .ToListAsync();
+
+            if (preliminaryCandidates.Count == 0)
+            {
+                return new List<PostShareAccountSearchModel>();
+            }
+
+            var candidateIds = preliminaryCandidates
+                .Select(x => x.AccountId)
+                .Distinct()
+                .ToList();
+
+            var directChatRows = await _context.Conversations
+                .AsNoTracking()
+                .Where(c => !c.IsDeleted && !c.IsGroup)
+                .Where(c => c.Members.Any(m => m.AccountId == currentId && !m.HasLeft))
+                .Where(c => c.Members.Any(m => candidateIds.Contains(m.AccountId) && !m.HasLeft))
+                .Select(c => new
+                {
+                    OtherAccountId = c.Members
+                        .Where(m => m.AccountId != currentId && candidateIds.Contains(m.AccountId) && !m.HasLeft)
+                        .Select(m => m.AccountId)
+                        .FirstOrDefault(),
+                    LastMessageAt = c.Messages.Select(m => (DateTime?)m.SentAt).Max()
+                })
+                .Where(x => x.OtherAccountId != Guid.Empty)
+                .ToListAsync();
+
+            var directChatMap = directChatRows
+                .GroupBy(x => x.OtherAccountId)
+                .ToDictionary(
+                    g => g.Key,
+                    g => g.Max(x => x.LastMessageAt)
+                );
+
+            var results = preliminaryCandidates
+                .Select(candidate =>
+                {
+                    directChatMap.TryGetValue(candidate.AccountId, out var lastContactedAt);
+                    var isContacted = directChatMap.ContainsKey(candidate.AccountId);
+
+                    return new PostShareAccountSearchModel
+                    {
+                        AccountId = candidate.AccountId,
+                        Username = candidate.Username,
+                        FullName = candidate.FullName,
+                        AvatarUrl = candidate.AvatarUrl,
+                        IsContacted = isContacted,
+                        LastContactedAt = lastContactedAt,
+                        MatchScore = ComputePostShareAccountMatchScore(candidate)
+                    };
+                })
+                .OrderByDescending(x => x.MatchScore)
+                .ThenByDescending(x => x.IsContacted)
+                .ThenByDescending(x => x.LastContactedAt)
+                .ThenBy(x => x.Username)
+                .Take(safeLimit)
+                .ToList();
+
+            return results;
+        }
+
         public async Task<List<Account>> GetAccountsByIds(IEnumerable<Guid> accountIds)
         {
             return await _context.Accounts
@@ -647,6 +757,57 @@ namespace CloudM.Infrastructure.Repositories.Accounts
             return Math.Min(limit, MaxInviteSearchLimit);
         }
 
+        private static int NormalizePostShareSearchLimit(int limit)
+        {
+            if (limit <= 0)
+            {
+                return DefaultPostShareSearchLimit;
+            }
+
+            return Math.Min(limit, MaxPostShareSearchLimit);
+        }
+
+        private static double ComputePostShareAccountMatchScore(PreliminaryPostShareAccountCandidate candidate)
+        {
+            double usernameScore;
+            if (candidate.UsernameStartsWith)
+            {
+                usernameScore = 3200d;
+            }
+            else if (candidate.UsernameContains)
+            {
+                usernameScore = 2200d;
+            }
+            else if (candidate.UsernameSimilarity >= FuzzySimilarityThreshold)
+            {
+                usernameScore = 1000d + ((candidate.UsernameSimilarity - FuzzySimilarityThreshold) * 1200d);
+            }
+            else
+            {
+                usernameScore = 0d;
+            }
+
+            double fullNameScore;
+            if (candidate.FullNameStartsWith)
+            {
+                fullNameScore = 2800d;
+            }
+            else if (candidate.FullNameContains)
+            {
+                fullNameScore = 1900d;
+            }
+            else if (candidate.FullNameSimilarity >= FuzzySimilarityThreshold)
+            {
+                fullNameScore = 900d + ((candidate.FullNameSimilarity - FuzzySimilarityThreshold) * 1000d);
+            }
+            else
+            {
+                fullNameScore = 0d;
+            }
+
+            return Math.Max(usernameScore, fullNameScore);
+        }
+
         private static double ComputeMatchScore(PreliminaryInviteSearchCandidate candidate)
         {
             double usernameScore;
@@ -727,6 +888,20 @@ namespace CloudM.Infrastructure.Repositories.Accounts
             public GroupChatInvitePermissionEnum InvitePermission { get; set; }
             public bool IsFollowing { get; set; }
             public bool IsFollower { get; set; }
+            public bool UsernameStartsWith { get; set; }
+            public bool FullNameStartsWith { get; set; }
+            public bool UsernameContains { get; set; }
+            public bool FullNameContains { get; set; }
+            public double UsernameSimilarity { get; set; }
+            public double FullNameSimilarity { get; set; }
+        }
+
+        private sealed class PreliminaryPostShareAccountCandidate
+        {
+            public Guid AccountId { get; set; }
+            public string Username { get; set; } = null!;
+            public string FullName { get; set; } = null!;
+            public string? AvatarUrl { get; set; }
             public bool UsernameStartsWith { get; set; }
             public bool FullNameStartsWith { get; set; }
             public bool UsernameContains { get; set; }

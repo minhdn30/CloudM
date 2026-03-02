@@ -497,6 +497,70 @@ namespace CloudM.Infrastructure.Repositories.Conversations
             return Task.CompletedTask;
         }
 
+        public async Task<List<PostShareGroupConversationSearchModel>> SearchGroupConversationsForPostShareAsync(
+            Guid currentId,
+            string keyword,
+            int limit = 20)
+        {
+            var normalizedKeyword = keyword?.Trim() ?? string.Empty;
+            var safeLimit = limit <= 0 ? 20 : Math.Min(limit, 300);
+
+            var baseQuery = _context.ConversationMembers
+                .AsNoTracking()
+                .Where(cm => cm.AccountId == currentId
+                    && !cm.HasLeft
+                    && cm.Conversation.IsGroup
+                    && !cm.Conversation.IsDeleted);
+
+            if (!string.IsNullOrWhiteSpace(normalizedKeyword))
+            {
+                var containsPattern = $"%{normalizedKeyword}%";
+                baseQuery = baseQuery.Where(cm =>
+                    cm.Conversation.ConversationName != null &&
+                    EF.Functions.ILike(cm.Conversation.ConversationName, containsPattern));
+            }
+
+            var startsWithPattern = $"{normalizedKeyword}%";
+            var containsPatternForScore = $"%{normalizedKeyword}%";
+
+            var candidates = await baseQuery
+                .Select(cm => new
+                {
+                    cm.ConversationId,
+                    ConversationName = cm.Conversation.ConversationName ?? "Group chat",
+                    cm.Conversation.ConversationAvatar,
+                    LastMessageAt = cm.Conversation.Messages
+                        .Select(m => (DateTime?)m.SentAt)
+                        .Max(),
+                    NameStartsWith = normalizedKeyword.Length > 0 &&
+                        cm.Conversation.ConversationName != null &&
+                        EF.Functions.ILike(cm.Conversation.ConversationName, startsWithPattern),
+                    NameContains = normalizedKeyword.Length > 0 &&
+                        cm.Conversation.ConversationName != null &&
+                        EF.Functions.ILike(cm.Conversation.ConversationName, containsPatternForScore)
+                })
+                .OrderByDescending(x => x.NameStartsWith)
+                .ThenByDescending(x => x.NameContains)
+                .ThenByDescending(x => x.LastMessageAt)
+                .ThenBy(x => x.ConversationName)
+                .Take(safeLimit)
+                .ToListAsync();
+
+            return candidates
+                .Select(item => new PostShareGroupConversationSearchModel
+                {
+                    ConversationId = item.ConversationId,
+                    ConversationName = item.ConversationName,
+                    ConversationAvatar = item.ConversationAvatar,
+                    IsContacted = true,
+                    LastContactedAt = item.LastMessageAt,
+                    MatchScore = ComputePostShareGroupMatchScore(
+                        item.NameStartsWith,
+                        item.NameContains)
+                })
+                .ToList();
+        }
+
         public async Task<int> GetUnreadConversationCountAsync(Guid currentId)
         {
             return await _context.ConversationMembers
@@ -514,6 +578,13 @@ namespace CloudM.Infrastructure.Repositories.Conversations
                         && (!cm.LastSeenAt.HasValue || m.SentAt > cm.LastSeenAt.Value)
                     )
                 );
+        }
+
+        private static double ComputePostShareGroupMatchScore(bool startsWith, bool contains)
+        {
+            if (startsWith) return 2600d;
+            if (contains) return 1900d;
+            return 0d;
         }
 
         private sealed class GroupAvatarProjection

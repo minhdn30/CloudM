@@ -1,0 +1,13 @@
+{
+  "liveServer.settings.host": "localhost",
+  "liveServer.settings.port": 5503,
+  "liveServer.settings.root": "/../CloudM.Client",
+  "liveServer.settings.file": "/index.html",
+  "liveServer.settings.AdvanceCustomBrowserCmdLine": "",
+  "liveServer.settings.https": {
+    "enable": true,
+    "cert": "../.certs/localhost-dev.pem",
+    "key": "../.certs/localhost-dev.key",
+    "passphrase": ""
+  }
+}

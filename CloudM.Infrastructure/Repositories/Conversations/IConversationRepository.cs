@@ -20,5 +20,6 @@ namespace CloudM.Infrastructure.Repositories.Conversations
         Task<Conversation?> GetConversationByIdAsync(Guid conversationId);
         Task UpdateConversationAsync(Conversation conversation);
         Task<int> GetUnreadConversationCountAsync(Guid currentId);
+        Task<List<PostShareGroupConversationSearchModel>> SearchGroupConversationsForPostShareAsync(Guid currentId, string keyword, int limit = 20);
     }
 }

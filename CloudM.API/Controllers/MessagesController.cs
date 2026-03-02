@@ -248,5 +248,40 @@ namespace CloudM.API.Controllers
             return Ok(result);
         }
 
+        [Authorize]
+        [HttpGet("share-post/targets")]
+        public async Task<IActionResult> SearchPostShareTargets([FromQuery] string? keyword, [FromQuery] int? limit = null)
+        {
+            var senderId = User.GetAccountId();
+            if (senderId == null)
+                return Unauthorized(new { message = "Invalid token: no AccountId found." });
+
+            var result = await _messageService.SearchPostShareTargetsAsync(senderId.Value, keyword, limit);
+            return Ok(result);
+        }
+
+        [Authorize]
+        [HttpPost("share-post")]
+        public async Task<IActionResult> SendPostShare([FromBody] SendPostShareRequest request)
+        {
+            var senderId = User.GetAccountId();
+            if (senderId == null)
+                return Unauthorized(new { message = "Invalid token: no AccountId found." });
+
+            if (request == null)
+                return BadRequest(new { message = "Request is required." });
+
+            if (request.PostId == Guid.Empty)
+                return BadRequest(new { message = "Post ID is required." });
+
+            var hasConversationTargets = request.ConversationIds != null && request.ConversationIds.Any(id => id != Guid.Empty);
+            var hasReceiverTargets = request.ReceiverIds != null && request.ReceiverIds.Any(id => id != Guid.Empty);
+            if (!hasConversationTargets && !hasReceiverTargets)
+                return BadRequest(new { message = "At least one recipient is required." });
+
+            var result = await _messageService.SendPostShareAsync(senderId.Value, request);
+            return Ok(result);
+        }
+
     }
 }

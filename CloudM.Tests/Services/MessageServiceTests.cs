@@ -17,6 +17,7 @@ using CloudM.Infrastructure.Repositories.ConversationMembers;
 using CloudM.Infrastructure.Repositories.Conversations;
 using CloudM.Infrastructure.Repositories.MessageMedias;
 using CloudM.Infrastructure.Repositories.Messages;
+using CloudM.Infrastructure.Repositories.Posts;
 using CloudM.Infrastructure.Repositories.Stories;
 using CloudM.Infrastructure.Repositories.UnitOfWork;
 using CloudM.Tests.Helpers;
@@ -32,6 +33,7 @@ namespace CloudM.Tests.Services
         private readonly Mock<IConversationRepository> _conversationRepositoryMock;
         private readonly Mock<IConversationMemberRepository> _conversationMemberRepositoryMock;
         private readonly Mock<IAccountRepository> _accountRepositoryMock;
+        private readonly Mock<IPostRepository> _postRepositoryMock;
         private readonly Mock<ICloudinaryService> _cloudinaryServiceMock;
         private readonly Mock<IFileTypeDetector> _fileTypeDetectorMock;
         private readonly Mock<IStoryRepository> _storyRepositoryMock;
@@ -47,6 +49,7 @@ namespace CloudM.Tests.Services
             _conversationRepositoryMock = new Mock<IConversationRepository>();
             _conversationMemberRepositoryMock = new Mock<IConversationMemberRepository>();
             _accountRepositoryMock = new Mock<IAccountRepository>();
+            _postRepositoryMock = new Mock<IPostRepository>();
             _cloudinaryServiceMock = new Mock<ICloudinaryService>();
             _fileTypeDetectorMock = new Mock<IFileTypeDetector>();
             _storyRepositoryMock = new Mock<IStoryRepository>();
@@ -60,6 +63,7 @@ namespace CloudM.Tests.Services
                 _conversationRepositoryMock.Object,
                 _conversationMemberRepositoryMock.Object,
                 _accountRepositoryMock.Object,
+                _postRepositoryMock.Object,
                 _mapperMock.Object,
                 _cloudinaryServiceMock.Object,
                 _fileTypeDetectorMock.Object,
@@ -503,6 +507,178 @@ namespace CloudM.Tests.Services
 
             result.StoryReplyInfo.MediaUrl.Should().NotBe(request.StoryMediaUrl);
             result.StoryReplyInfo.ContentType.Should().NotBe(request.StoryContentType);
+        }
+
+        #endregion
+
+        #region SendPostShareAsync Tests
+
+        [Fact]
+        public async Task SendPostShareAsync_DuplicateTargetAfterFailedConversationShare_ShouldKeepFailedStatus()
+        {
+            // Arrange
+            var senderId = Guid.NewGuid();
+            var receiverId = Guid.NewGuid();
+            var postId = Guid.NewGuid();
+            var conversationId = Guid.NewGuid();
+
+            var sender = TestDataFactory.CreateAccount(accountId: senderId);
+            var receiver = TestDataFactory.CreateAccount(accountId: receiverId);
+            var post = new PostDetailModel
+            {
+                PostId = postId,
+                PostCode = "POST-123",
+                Owner = TestDataFactory.CreateAccountBasicInfoModel(Guid.NewGuid()),
+                Content = "Post content"
+            };
+
+            _accountRepositoryMock.Setup(x => x.GetAccountById(senderId)).ReturnsAsync(sender);
+            _accountRepositoryMock
+                .Setup(x => x.GetAccountsByIds(It.Is<IEnumerable<Guid>>(ids => ids.Contains(receiverId))))
+                .ReturnsAsync(new List<Account> { receiver });
+            _postRepositoryMock.Setup(x => x.GetPostDetailByPostId(postId, senderId)).ReturnsAsync(post);
+            _mapperMock.Setup(x => x.Map<AccountChatInfoResponse>(sender)).Returns(new AccountChatInfoResponse
+            {
+                AccountId = senderId,
+                Username = sender.Username,
+                FullName = sender.FullName,
+                AvatarUrl = sender.AvatarUrl,
+                IsActive = true
+            });
+
+            _conversationRepositoryMock
+                .Setup(x => x.GetConversationByIdAsync(conversationId))
+                .ReturnsAsync(TestDataFactory.CreateConversation(conversationId));
+            _conversationMemberRepositoryMock
+                .Setup(x => x.IsMemberOfConversation(conversationId, senderId))
+                .ReturnsAsync(false);
+            _conversationRepositoryMock
+                .Setup(x => x.GetPrivateConversationIdAsync(senderId, receiverId))
+                .ReturnsAsync(conversationId);
+
+            var request = new SendPostShareRequest
+            {
+                PostId = postId,
+                ConversationIds = new List<Guid> { conversationId },
+                ReceiverIds = new List<Guid> { receiverId }
+            };
+
+            // Act
+            var result = await _messageService.SendPostShareAsync(senderId, request);
+
+            // Assert
+            result.TotalRequested.Should().Be(2);
+            result.TotalSucceeded.Should().Be(0);
+            result.TotalFailed.Should().Be(2);
+            result.Results.Should().HaveCount(2);
+            result.Results.Should().OnlyContain(item => !item.IsSuccess);
+            result.Results
+                .Where(item => item.ConversationId == conversationId)
+                .Select(item => item.ErrorMessage)
+                .Should()
+                .OnlyContain(message => message == "You are not a member of this conversation.");
+        }
+
+        [Fact]
+        public async Task SendPostShareAsync_DuplicateTargetAfterSuccessfulConversationShare_ShouldNotSendTwice()
+        {
+            // Arrange
+            var senderId = Guid.NewGuid();
+            var receiverId = Guid.NewGuid();
+            var postId = Guid.NewGuid();
+            var conversationId = Guid.NewGuid();
+
+            var sender = TestDataFactory.CreateAccount(accountId: senderId);
+            var receiver = TestDataFactory.CreateAccount(accountId: receiverId);
+            var post = new PostDetailModel
+            {
+                PostId = postId,
+                PostCode = "POST-ABC",
+                Owner = TestDataFactory.CreateAccountBasicInfoModel(Guid.NewGuid()),
+                Content = "Post content"
+            };
+
+            _accountRepositoryMock.Setup(x => x.GetAccountById(senderId)).ReturnsAsync(sender);
+            _accountRepositoryMock
+                .Setup(x => x.GetAccountsByIds(It.Is<IEnumerable<Guid>>(ids => ids.Contains(receiverId))))
+                .ReturnsAsync(new List<Account> { receiver });
+            _postRepositoryMock.Setup(x => x.GetPostDetailByPostId(postId, senderId)).ReturnsAsync(post);
+
+            _mapperMock.Setup(x => x.Map<AccountChatInfoResponse>(sender)).Returns(new AccountChatInfoResponse
+            {
+                AccountId = senderId,
+                Username = sender.Username,
+                FullName = sender.FullName,
+                AvatarUrl = sender.AvatarUrl,
+                IsActive = true
+            });
+
+            _conversationRepositoryMock
+                .Setup(x => x.GetConversationByIdAsync(conversationId))
+                .ReturnsAsync(TestDataFactory.CreateConversation(conversationId));
+            _conversationMemberRepositoryMock
+                .Setup(x => x.IsMemberOfConversation(conversationId, senderId))
+                .ReturnsAsync(true);
+            _conversationRepositoryMock
+                .Setup(x => x.GetPrivateConversationIdAsync(senderId, receiverId))
+                .ReturnsAsync(conversationId);
+            _messageRepositoryMock
+                .Setup(x => x.AddMessageAsync(It.IsAny<Message>()))
+                .Returns(Task.CompletedTask);
+
+            _unitOfWorkMock
+                .Setup(x => x.ExecuteInTransactionAsync(
+                    It.IsAny<Func<Task<SendMessageResponse>>>(),
+                    It.IsAny<Func<Task>?>()))
+                .Returns((Func<Task<SendMessageResponse>> operation, Func<Task>? _) => operation());
+
+            _mapperMock
+                .Setup(x => x.Map<SendMessageResponse>(It.IsAny<Message>()))
+                .Returns<Message>(message => new SendMessageResponse
+                {
+                    MessageId = message.MessageId,
+                    ConversationId = message.ConversationId,
+                    MessageType = message.MessageType,
+                    SentAt = message.SentAt
+                });
+
+            _conversationMemberRepositoryMock
+                .Setup(x => x.GetMembersWithMuteStatusAsync(conversationId))
+                .ReturnsAsync(new Dictionary<Guid, bool> { { senderId, false }, { receiverId, false } });
+            _realtimeServiceMock
+                .Setup(x => x.NotifyNewMessageAsync(
+                    conversationId,
+                    It.IsAny<Dictionary<Guid, bool>>(),
+                    It.IsAny<SendMessageResponse>()))
+                .Returns(Task.CompletedTask);
+
+            var request = new SendPostShareRequest
+            {
+                PostId = postId,
+                ConversationIds = new List<Guid> { conversationId },
+                ReceiverIds = new List<Guid> { receiverId }
+            };
+
+            // Act
+            var result = await _messageService.SendPostShareAsync(senderId, request);
+
+            // Assert
+            result.TotalRequested.Should().Be(2);
+            result.TotalSucceeded.Should().Be(2);
+            result.TotalFailed.Should().Be(0);
+            result.Results.Should().HaveCount(2);
+
+            var successfulResults = result.Results
+                .Where(item => item.ConversationId == conversationId && item.IsSuccess)
+                .ToList();
+            successfulResults.Should().HaveCount(2);
+            successfulResults.Should().OnlyContain(item => item.Message != null);
+
+            _messageRepositoryMock.Verify(x => x.AddMessageAsync(It.IsAny<Message>()), Times.Once);
+            _realtimeServiceMock.Verify(x => x.NotifyNewMessageAsync(
+                conversationId,
+                It.IsAny<Dictionary<Guid, bool>>(),
+                It.IsAny<SendMessageResponse>()), Times.Once);
         }
 
         #endregion

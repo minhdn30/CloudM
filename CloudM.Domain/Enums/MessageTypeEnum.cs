@@ -11,6 +11,7 @@ namespace CloudM.Domain.Enums
         Text = 1,    // msg text
         Media = 2,   // msg image / video / file
         System = 3,  // system msg (add member, leave, rename group...)
-        StoryReply = 4 // reply to a story (snapshot data stored in SystemMessageDataJson)
+        StoryReply = 4, // reply to a story (snapshot data stored in SystemMessageDataJson)
+        PostShare = 5 // share a post to chat (snapshot data stored in SystemMessageDataJson)
     }
 }

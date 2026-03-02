@@ -17,5 +17,7 @@ namespace CloudM.Application.Services.MessageServices
         Task<string> GetMediaDownloadUrlAsync(Guid messageMediaId, Guid accountId);
         Task<RecallMessageResponse> RecallMessageAsync(Guid messageId, Guid accountId);
         Task<SendMessageResponse> SendStoryReplyAsync(Guid senderId, SendStoryReplyRequest request);
+        Task<SearchPostShareTargetsResponse> SearchPostShareTargetsAsync(Guid senderId, string? keyword, int? limit = null);
+        Task<SendPostShareResponse> SendPostShareAsync(Guid senderId, SendPostShareRequest request);
     }
 }

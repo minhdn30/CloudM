@@ -25,5 +25,6 @@ namespace CloudM.Application.DTOs.MessageDTOs
         public List<MessageMediaResponse>? Medias { get; set; }
         public ReplyInfoModel? ReplyTo { get; set; }
         public StoryReplyInfoModel? StoryReplyInfo { get; set; }
+        public PostShareInfoModel? PostShareInfo { get; set; }
     }
 }

@@ -25,5 +25,6 @@ namespace CloudM.Infrastructure.Models
         public ReactEnum? CurrentUserReactType { get; set; }
         public ReplyInfoModel? ReplyTo { get; set; }
         public StoryReplyInfoModel? StoryReplyInfo { get; set; }
+        public PostShareInfoModel? PostShareInfo { get; set; }
     }
 }

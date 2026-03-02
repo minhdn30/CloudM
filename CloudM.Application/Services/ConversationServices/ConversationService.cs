@@ -630,6 +630,13 @@ namespace CloudM.Application.Services.ConversationServices
             if (msg.MessageType == MessageTypeEnum.System)
                 return msg.Content;
 
+            if (msg.MessageType == MessageTypeEnum.PostShare)
+            {
+                if (!string.IsNullOrWhiteSpace(msg.Content))
+                    return msg.Content;
+                return "Shared a post";
+            }
+
             return msg.Content;
         }
 

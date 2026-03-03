@@ -1,6 +1,7 @@
 using CloudM.Application.DTOs.AccountDTOs;
 using CloudM.Application.DTOs.MessageMediaDTOs;
 using CloudM.Domain.Enums;
+using CloudM.Infrastructure.Models;
 using System;
 using System.Collections.Generic;
 
@@ -14,14 +15,18 @@ namespace CloudM.Application.DTOs.PinnedMessageDTOs
         public MessageTypeEnum MessageType { get; set; }
         public DateTime SentAt { get; set; }
         public bool IsRecalled { get; set; }
+        public bool HasReply { get; set; }
+        public ReplyInfoModel? ReplyTo { get; set; }
+        public StoryReplyInfoModel? StoryReplyInfo { get; set; }
+        public PostShareInfoModel? PostShareInfo { get; set; }
 
-        // Original message sender
+        // original message sender
         public AccountChatInfoResponse Sender { get; set; } = null!;
 
-        // Media (null if recalled)
+        // media (null if recalled)
         public List<MessageMediaResponse>? Medias { get; set; }
 
-        // Pin metadata
+        // pin metadata
         public AccountChatInfoResponse PinnedByAccount { get; set; } = null!;
         public DateTime PinnedAt { get; set; }
     }

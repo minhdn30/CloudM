@@ -1,3 +1,4 @@
+using CloudM.Application.DTOs.CommonDTOs;
 using AutoMapper;
 using CloudM.Application.DTOs.AccountDTOs;
 using CloudM.Application.DTOs.MessageDTOs;
@@ -54,17 +55,60 @@ namespace CloudM.Application.Services.PinnedMessageServices
 
         public async Task<IEnumerable<PinnedMessageResponse>> GetPinnedMessagesAsync(Guid conversationId, Guid currentAccountId)
         {
+            const int legacyBatchSize = 50;
+            var firstPage = await GetPinnedMessagesAsync(
+                conversationId,
+                currentAccountId,
+                1,
+                legacyBatchSize);
+
+            var allItems = new List<PinnedMessageResponse>();
+            if (firstPage.Items != null && firstPage.Items.Any())
+            {
+                allItems.AddRange(firstPage.Items);
+            }
+
+            if (firstPage.TotalPages <= 1)
+            {
+                return allItems;
+            }
+
+            for (var page = 2; page <= firstPage.TotalPages; page++)
+            {
+                var pageResult = await GetPinnedMessagesAsync(
+                    conversationId,
+                    currentAccountId,
+                    page,
+                    legacyBatchSize);
+
+                if (pageResult.Items != null && pageResult.Items.Any())
+                {
+                    allItems.AddRange(pageResult.Items);
+                }
+            }
+
+            return allItems;
+        }
+
+        public async Task<PagedResponse<PinnedMessageResponse>> GetPinnedMessagesAsync(Guid conversationId, Guid currentAccountId, int page, int pageSize)
+        {
             // verify membership
             var member = await _conversationMemberRepository.GetConversationMemberAsync(conversationId, currentAccountId);
             if (member == null || member.HasLeft)
                 throw new ForbiddenException("You are not a member of this conversation.");
 
+            if (page <= 0) page = 1;
+            if (pageSize <= 0) pageSize = 20;
+            if (pageSize > 50) pageSize = 50;
+
             var clearedAt = member.ClearedAt;
 
-            // query pinned messages with filters: ClearedAt + HiddenBy via Repository
-            var pinnedMessages = await _pinnedMessageRepository.GetPinnedMessagesByConversationIdAsync(conversationId, clearedAt, currentAccountId);
+            // query pinned messages with filters: clearedAt + hiddenBy via repository
+            var (pinnedMessages, totalItems) = await _pinnedMessageRepository
+                .GetPinnedMessagesByConversationIdAsync(conversationId, clearedAt, currentAccountId, page, pageSize);
 
-            return _mapper.Map<IEnumerable<PinnedMessageResponse>>(pinnedMessages);
+            var responseItems = _mapper.Map<IReadOnlyList<PinnedMessageResponse>>(pinnedMessages);
+            return new PagedResponse<PinnedMessageResponse>(responseItems, page, pageSize, totalItems);
         }
 
         public async Task PinMessageAsync(Guid conversationId, Guid messageId, Guid currentAccountId)
@@ -193,14 +237,14 @@ namespace CloudM.Application.Services.PinnedMessageServices
 
             if (conversation.IsGroup)
             {
-                // group: only admins can pin/unpin
+                // group: only admins can pin or unpin
                 var member = await _conversationMemberRepository.GetConversationMemberAsync(conversationId, currentAccountId);
                 var ownerId = conversation.Owner ?? (conversation.CreatedBy != Guid.Empty ? conversation.CreatedBy : Guid.Empty);
                 var isOwner = ownerId != Guid.Empty && ownerId == currentAccountId;
                 if (member == null || (!member.IsAdmin && !isOwner))
                     throw new ForbiddenException("Only group admins can pin or unpin messages.");
             }
-            // 1:1 chat: anyone can pin/unpin (no check needed)
+            // 1:1 chat: anyone can pin or unpin
         }
     }
 }

@@ -11,6 +11,11 @@ namespace CloudM.Infrastructure.Repositories.PinnedMessages
         Task<bool> IsPinnedAsync(Guid conversationId, Guid messageId);
         Task AddAsync(PinnedMessage pinnedMessage);
         Task RemoveAsync(Guid conversationId, Guid messageId);
-        Task<IEnumerable<PinnedMessageModel>> GetPinnedMessagesByConversationIdAsync(Guid conversationId, DateTime? clearedAt, Guid currentAccountId);
+        Task<(IReadOnlyList<PinnedMessageModel> Items, int TotalItems)> GetPinnedMessagesByConversationIdAsync(
+            Guid conversationId,
+            DateTime? clearedAt,
+            Guid currentAccountId,
+            int page,
+            int pageSize);
     }
 }

@@ -141,22 +141,37 @@ namespace CloudM.API.Controllers
             return Ok(new { url = downloadUrl });
         }
 
-        // PINNED MESSAGES
+        // pinned messages
 
-        // Get all pinned messages for a conversation
+        // get pinned messages for a conversation
         [Authorize]
         [HttpGet("pinned/{conversationId}")]
-        public async Task<IActionResult> GetPinnedMessages(Guid conversationId)
+        public async Task<IActionResult> GetPinnedMessages(
+            Guid conversationId,
+            [FromQuery] int? page = null,
+            [FromQuery] int? pageSize = null)
         {
             var currentId = User.GetAccountId();
             if (currentId == null)
                 return Unauthorized(new { message = "Invalid token: no AccountId found." });
 
-            var result = await _pinnedMessageService.GetPinnedMessagesAsync(conversationId, currentId.Value);
-            return Ok(result);
+            var hasPagingQuery = page.HasValue || pageSize.HasValue;
+            if (!hasPagingQuery)
+            {
+                var legacyResult = await _pinnedMessageService
+                    .GetPinnedMessagesAsync(conversationId, currentId.Value);
+                return Ok(legacyResult);
+            }
+
+            var pagedResult = await _pinnedMessageService.GetPinnedMessagesAsync(
+                conversationId,
+                currentId.Value,
+                page ?? 1,
+                pageSize ?? 20);
+            return Ok(pagedResult);
         }
 
-        // Pin a message in a conversation
+        // pin a message in a conversation
         [Authorize]
         [HttpPost("pin/{conversationId}/{messageId}")]
         public async Task<IActionResult> PinMessage(Guid conversationId, Guid messageId)
@@ -169,7 +184,7 @@ namespace CloudM.API.Controllers
             return Ok(new { message = "Message pinned successfully." });
         }
 
-        // Unpin a message from a conversation
+        // unpin a message from a conversation
         [Authorize]
         [HttpDelete("unpin/{conversationId}/{messageId}")]
         public async Task<IActionResult> UnpinMessage(Guid conversationId, Guid messageId)

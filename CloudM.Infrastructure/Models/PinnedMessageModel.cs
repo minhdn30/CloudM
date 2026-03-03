@@ -12,8 +12,13 @@ namespace CloudM.Infrastructure.Models
         public MessageTypeEnum MessageType { get; set; }
         public DateTime SentAt { get; set; }
         public bool IsRecalled { get; set; }
+        public bool HasReply { get; set; }
+        public string? SystemMessageDataJson { get; set; }
         public AccountChatInfoModel Sender { get; set; } = null!;
         public List<MessageMediaBasicModel>? Medias { get; set; }
+        public ReplyInfoModel? ReplyTo { get; set; }
+        public StoryReplyInfoModel? StoryReplyInfo { get; set; }
+        public PostShareInfoModel? PostShareInfo { get; set; }
         public AccountChatInfoModel PinnedByAccount { get; set; } = null!;
         public DateTime PinnedAt { get; set; }
     }

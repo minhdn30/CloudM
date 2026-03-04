@@ -101,6 +101,7 @@ namespace CloudM.Infrastructure.Repositories.Posts
                     IsReactedByCurrentUser = p.Reacts.Any(r => r.AccountId == currentId && r.Account.Status == AccountStatusEnum.Active),
                     IsSavedByCurrentUser = _context.PostSaves.Any(s => s.PostId == p.PostId && s.AccountId == currentId),
                     IsOwner = p.AccountId == currentId,
+                    IsCurrentUserTagged = p.Tags.Any(t => t.TaggedAccountId == currentId),
                     IsFollowedByCurrentUser = isFollower
                 })
                 .FirstOrDefaultAsync();
@@ -175,6 +176,7 @@ namespace CloudM.Infrastructure.Repositories.Posts
                     IsReactedByCurrentUser = p.Reacts.Any(r => r.AccountId == currentId && r.Account.Status == AccountStatusEnum.Active),
                     IsSavedByCurrentUser = _context.PostSaves.Any(s => s.PostId == p.PostId && s.AccountId == currentId),
                     IsOwner = p.AccountId == currentId,
+                    IsCurrentUserTagged = p.Tags.Any(t => t.TaggedAccountId == currentId),
                     IsFollowedByCurrentUser = isFollower
                 })
                 .FirstOrDefaultAsync();
@@ -745,6 +747,7 @@ namespace CloudM.Infrastructure.Repositories.Posts
                     g => new
                     {
                         Total = g.Count(),
+                        IsCurrentUserTagged = g.Any(x => x.TaggedAccountId == currentId),
                         Preview = g
                             .OrderByDescending(x => x.TaggedAccountId == currentId)
                             .ThenByDescending(x => followingIdSet.Contains(x.TaggedAccountId))
@@ -795,6 +798,7 @@ namespace CloudM.Infrastructure.Repositories.Posts
                         TaggedAccountsPreview = postTagInfo?.Preview
                             ?? new List<PostTaggedAccountModel>(),
                         TotalTaggedAccounts = postTagInfo?.Total ?? 0,
+                        IsCurrentUserTagged = postTagInfo?.IsCurrentUserTagged ?? false,
                         MediaCount = x.MediaCount,
                         ReactCount = x.ReactCount,
                         CommentCount = x.CommentCount,

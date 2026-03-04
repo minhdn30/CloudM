@@ -20,6 +20,7 @@ namespace CloudM.Infrastructure.Models
         public int CommentCount { get; set; }
         public bool IsReactedByCurrentUser { get; set; }
         public bool IsSavedByCurrentUser { get; set; }
+        public bool IsCurrentUserTagged { get; set; }
         public bool IsOwner { get; set; }
         [JsonIgnore]
         public int ReplyCount { get; set; }

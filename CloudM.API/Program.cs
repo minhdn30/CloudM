@@ -157,6 +157,8 @@ namespace CloudM.API
                 builder.Configuration.GetSection("ChatMention"));
             builder.Services.Configure<NotificationOptions>(
                 builder.Configuration.GetSection("NotificationOptions"));
+            builder.Services.Configure<FollowAutoAcceptOptions>(
+                builder.Configuration.GetSection("FollowAutoAccept"));
             builder.Services.AddSingleton<IConnectionMultiplexer>(_ =>
             {
                 var redisConnectionString = BuildRedisConnectionString(builder.Configuration);
@@ -178,6 +180,7 @@ namespace CloudM.API
             builder.Services.AddScoped<IEmailVerificationRateLimitService, RedisEmailVerificationRateLimitService>();
             builder.Services.AddScoped<IJwtService, JwtService>();
             builder.Services.AddScoped<IFollowService, FollowService>();
+            builder.Services.AddScoped<IFollowAutoAcceptService, FollowAutoAcceptService>();
             builder.Services.AddScoped<IPostService, PostService>();
             builder.Services.AddScoped<IPostTagService, PostTagService>();
             builder.Services.AddScoped<IPostSaveService, PostSaveService>();
@@ -205,6 +208,7 @@ namespace CloudM.API
             builder.Services.AddHostedService<EmailVerificationCleanupHostedService>();
             builder.Services.AddHostedService<OnlinePresenceCleanupHostedService>();
             builder.Services.AddHostedService<NotificationOutboxWorkerHostedService>();
+            builder.Services.AddHostedService<FollowAutoAcceptWorkerHostedService>();
 
             // Helpers
             builder.Services.AddScoped<IStoryRingStateHelper, StoryRingStateHelper>();

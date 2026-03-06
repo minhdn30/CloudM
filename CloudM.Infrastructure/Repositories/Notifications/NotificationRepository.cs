@@ -181,6 +181,30 @@ namespace CloudM.Infrastructure.Repositories.Notifications
                 .ToListAsync(cancellationToken);
         }
 
+        public async Task DeleteByRecipientAndAggregateKeysAsync(
+            Guid recipientId,
+            NotificationTypeEnum type,
+            IEnumerable<string> aggregateKeys,
+            CancellationToken cancellationToken = default)
+        {
+            var safeAggregateKeys = (aggregateKeys ?? Enumerable.Empty<string>())
+                .Select(x => (x ?? string.Empty).Trim())
+                .Where(x => x.Length > 0)
+                .Distinct()
+                .ToList();
+            if (recipientId == Guid.Empty || safeAggregateKeys.Count == 0)
+            {
+                return;
+            }
+
+            await _context.Notifications
+                .Where(x =>
+                    x.RecipientId == recipientId &&
+                    x.Type == type &&
+                    safeAggregateKeys.Contains(x.AggregateKey))
+                .ExecuteDeleteAsync(cancellationToken);
+        }
+
         public Task SaveChangesAsync(CancellationToken cancellationToken = default)
         {
             return _context.SaveChangesAsync(cancellationToken);

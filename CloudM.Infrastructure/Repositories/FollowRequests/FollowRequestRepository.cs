@@ -1,6 +1,9 @@
 using CloudM.Domain.Entities;
+using CloudM.Domain.Enums;
 using CloudM.Infrastructure.Data;
 using Microsoft.EntityFrameworkCore;
+using Npgsql;
+using NpgsqlTypes;
 
 namespace CloudM.Infrastructure.Repositories.FollowRequests
 {
@@ -25,11 +28,73 @@ namespace CloudM.Infrastructure.Repositories.FollowRequests
             return Task.CompletedTask;
         }
 
-        public async Task RemoveFollowRequestAsync(Guid requesterId, Guid targetId)
+        public async Task<bool> AddFollowRequestIgnoreExistingAsync(FollowRequest followRequest, CancellationToken cancellationToken = default)
         {
-            await _context.FollowRequests
+            if (followRequest == null ||
+                followRequest.RequesterId == Guid.Empty ||
+                followRequest.TargetId == Guid.Empty ||
+                followRequest.RequesterId == followRequest.TargetId)
+            {
+                return false;
+            }
+
+            var requesterIdParam = new NpgsqlParameter<Guid>("p_requester_id", followRequest.RequesterId);
+            var targetIdParam = new NpgsqlParameter<Guid>("p_target_id", followRequest.TargetId);
+            var createdAtParam = new NpgsqlParameter<DateTime>("p_created_at", NpgsqlDbType.TimestampTz)
+            {
+                TypedValue = DateTime.SpecifyKind(
+                    followRequest.CreatedAt == default ? DateTime.UtcNow : followRequest.CreatedAt,
+                    DateTimeKind.Utc)
+            };
+
+            var affected = await _context.Database.ExecuteSqlRawAsync(@"
+INSERT INTO ""FollowRequests"" (""RequesterId"", ""TargetId"", ""CreatedAt"")
+VALUES (@p_requester_id, @p_target_id, @p_created_at)
+ON CONFLICT (""RequesterId"", ""TargetId"") DO NOTHING;",
+                new object[] { requesterIdParam, targetIdParam, createdAtParam },
+                cancellationToken);
+
+            return affected > 0;
+        }
+
+        public async Task<int> RemoveFollowRequestAsync(Guid requesterId, Guid targetId)
+        {
+            return await _context.FollowRequests
                 .Where(fr => fr.RequesterId == requesterId && fr.TargetId == targetId)
                 .ExecuteDeleteAsync();
+        }
+
+        public async Task<List<ClaimedAutoAcceptFollowRequest>> ClaimAutoAcceptBatchAsync(int batchSize, CancellationToken cancellationToken = default)
+        {
+            var safeBatchSize = Math.Max(1, batchSize);
+            var sql = $@"
+WITH picked AS (
+    SELECT
+        fr.""RequesterId"",
+        fr.""TargetId"",
+        requester.""Status"" AS ""RequesterStatus""
+    FROM ""FollowRequests"" fr
+    INNER JOIN ""AccountSettings"" settings ON settings.""AccountId"" = fr.""TargetId""
+    INNER JOIN ""Accounts"" requester ON requester.""AccountId"" = fr.""RequesterId""
+    INNER JOIN ""Accounts"" target ON target.""AccountId"" = fr.""TargetId""
+    WHERE settings.""FollowPrivacy"" = {(int)FollowPrivacyEnum.Anyone}
+      AND target.""Status"" = {(int)AccountStatusEnum.Active}
+    ORDER BY fr.""CreatedAt"", fr.""TargetId"", fr.""RequesterId""
+    LIMIT {safeBatchSize}
+    FOR UPDATE OF fr SKIP LOCKED
+)
+DELETE FROM ""FollowRequests"" fr
+USING picked
+WHERE fr.""RequesterId"" = picked.""RequesterId""
+  AND fr.""TargetId"" = picked.""TargetId""
+RETURNING
+    picked.""RequesterId"",
+    picked.""TargetId"",
+    picked.""RequesterStatus"";";
+
+            return await _context.Database
+                .SqlQueryRaw<ClaimedAutoAcceptFollowRequest>(sql)
+                .ToListAsync(cancellationToken);
         }
     }
 }

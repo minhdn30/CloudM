@@ -55,6 +55,8 @@ namespace CloudM.Application.Services.RealtimeServices
             int myFollowers,
             int myFollowing,
             string? currentUserAction = null);
+        Task NotifyCurrentUserFollowChangedAsync(Guid currentId, Guid relatedTargetId, string action, int myFollowers, int myFollowing);
+        Task NotifyFollowStatsChangedAsync(Guid targetId, int targetFollowers, int targetFollowing, string action = "follow_stats_updated");
 
         // account notifications
 

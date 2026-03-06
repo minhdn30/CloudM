@@ -17,6 +17,7 @@ namespace CloudM.Infrastructure.Repositories.Comments
         Task<bool> IsCommentExist(Guid commentId);
         Task<int> CountCommentsByPostId(Guid postId);
         Task DeleteCommentWithReplies(Guid commentId);
+        Task<List<Comment>> GetCommentThreadForDeleteAsync(Guid commentId);
         Task<bool> IsCommentCanReply(Guid commentId);
         Task<int> CountCommentRepliesAsync(Guid commentId);
         Task<(IEnumerable<ReplyCommentModel> items, int totalItems)> GetRepliesByCommentIdAsync(Guid parentCommentId, Guid? currentId, int page, int pageSize);

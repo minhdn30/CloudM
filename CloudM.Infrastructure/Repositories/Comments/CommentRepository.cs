@@ -95,6 +95,14 @@ namespace CloudM.Infrastructure.Repositories.Comments
             _context.Comments.RemoveRange(commentsToDelete);
         }
 
+        public async Task<List<Comment>> GetCommentThreadForDeleteAsync(Guid commentId)
+        {
+            return await _context.Comments
+                .Include(x => x.Account)
+                .Where(x => x.CommentId == commentId || x.ParentCommentId == commentId)
+                .ToListAsync();
+        }
+
         public async Task<bool> IsCommentCanReply(Guid commentId)
         {
             return await _context.Comments.AnyAsync(c => c.CommentId == commentId && c.ParentCommentId == null && c.Account.Status == AccountStatusEnum.Active);

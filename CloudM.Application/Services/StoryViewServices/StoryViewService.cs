@@ -6,6 +6,7 @@ using CloudM.Infrastructure.Repositories.Stories;
 using CloudM.Infrastructure.Repositories.StoryViews;
 using CloudM.Infrastructure.Repositories.UnitOfWork;
 using CloudM.Infrastructure.Models;
+using CloudM.Application.Services.NotificationServices;
 using AutoMapper;
 using static CloudM.Domain.Exceptions.CustomExceptions;
 
@@ -20,17 +21,34 @@ namespace CloudM.Application.Services.StoryViewServices
         private readonly IStoryRepository _storyRepository;
         private readonly IUnitOfWork _unitOfWork;
         private readonly IMapper _mapper;
+        private readonly INotificationService _notificationService;
+
+        public StoryViewService(
+            IStoryViewRepository storyViewRepository,
+            IStoryRepository storyRepository,
+            IUnitOfWork unitOfWork,
+            IMapper mapper,
+            INotificationService notificationService)
+        {
+            _storyViewRepository = storyViewRepository;
+            _storyRepository = storyRepository;
+            _unitOfWork = unitOfWork;
+            _mapper = mapper;
+            _notificationService = notificationService;
+        }
 
         public StoryViewService(
             IStoryViewRepository storyViewRepository,
             IStoryRepository storyRepository,
             IUnitOfWork unitOfWork,
             IMapper mapper)
+            : this(
+                storyViewRepository,
+                storyRepository,
+                unitOfWork,
+                mapper,
+                NullNotificationService.Instance)
         {
-            _storyViewRepository = storyViewRepository;
-            _storyRepository = storyRepository;
-            _unitOfWork = unitOfWork;
-            _mapper = mapper;
         }
 
         public async Task<StoryMarkViewedResponse> MarkStoriesViewedAsync(Guid currentId, StoryMarkViewedRequest request)
@@ -165,6 +183,7 @@ namespace CloudM.Application.Services.StoryViewServices
             var reactType = (ReactEnum)request.ReactType;
             var storyView = await _storyViewRepository.GetStoryViewAsync(storyId, currentId);
             var createdInThisRequest = false;
+            var notificationAction = NotificationAggregateActionEnum.Upsert;
 
             if (storyView == null)
             {
@@ -202,15 +221,35 @@ namespace CloudM.Application.Services.StoryViewServices
                     // Unreact
                     storyView.ReactType = null;
                     storyView.ReactedAt = null;
+                    notificationAction = NotificationAggregateActionEnum.Deactivate;
                 }
                 else
                 {
                     // Upsert react
                     storyView.ReactType = reactType;
                     storyView.ReactedAt = nowUtc;
+                    notificationAction = NotificationAggregateActionEnum.Upsert;
                 }
 
                 await _storyViewRepository.UpdateStoryViewAsync(storyView);
+            }
+
+            if (story.AccountId != currentId)
+            {
+                await _notificationService.EnqueueAggregateEventAsync(new NotificationAggregateEvent
+                {
+                    RecipientId = story.AccountId,
+                    Action = notificationAction,
+                    Type = NotificationTypeEnum.StoryReact,
+                    AggregateKey = NotificationAggregateKeys.StoryReact(storyId),
+                    SourceType = NotificationSourceTypeEnum.StoryReact,
+                    SourceId = currentId,
+                    ActorId = currentId,
+                    TargetKind = NotificationTargetKindEnum.Story,
+                    TargetId = storyId,
+                    KeepWhenEmpty = false,
+                    OccurredAt = nowUtc
+                });
             }
 
             await _unitOfWork.CommitAsync();

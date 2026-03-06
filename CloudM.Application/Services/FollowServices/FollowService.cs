@@ -8,6 +8,7 @@ using CloudM.Infrastructure.Repositories.Accounts;
 using CloudM.Infrastructure.Repositories.Follows;
 using CloudM.Infrastructure.Repositories.AccountSettingRepos;
 using CloudM.Infrastructure.Repositories.UnitOfWork;
+using CloudM.Application.Services.NotificationServices;
 using CloudM.Application.Services.RealtimeServices;
 using System;
 using System.Collections.Generic;
@@ -24,18 +25,38 @@ namespace CloudM.Application.Services.FollowServices
         private readonly IAccountRepository _accountRepository;
         private readonly IAccountSettingRepository _accountSettingRepository;
         private readonly IMapper _mapper;
+        private readonly INotificationService _notificationService;
         private readonly IRealtimeService _realtimeService;
         private readonly IUnitOfWork _unitOfWork;
 
         public FollowService(IFollowRepository followRepository, IMapper mapper, IAccountRepository accountRepository, 
-            IAccountSettingRepository accountSettingRepository, IRealtimeService realtimeService, IUnitOfWork unitOfWork)
+            IAccountSettingRepository accountSettingRepository, INotificationService notificationService, IRealtimeService realtimeService, IUnitOfWork unitOfWork)
         {
             _followRepository = followRepository;
             _mapper = mapper;
             _accountRepository = accountRepository;
             _accountSettingRepository = accountSettingRepository;
+            _notificationService = notificationService;
             _realtimeService = realtimeService;
             _unitOfWork = unitOfWork;
+        }
+
+        public FollowService(
+            IFollowRepository followRepository,
+            IMapper mapper,
+            IAccountRepository accountRepository,
+            IAccountSettingRepository accountSettingRepository,
+            IRealtimeService realtimeService,
+            IUnitOfWork unitOfWork)
+            : this(
+                followRepository,
+                mapper,
+                accountRepository,
+                accountSettingRepository,
+                NullNotificationService.Instance,
+                realtimeService,
+                unitOfWork)
+        {
         }
 
         public async Task<FollowCountResponse> FollowAsync(Guid followerId, Guid targetId)
@@ -55,6 +76,20 @@ namespace CloudM.Application.Services.FollowServices
             return await _unitOfWork.ExecuteInTransactionAsync(async () =>
             {
                 await _followRepository.AddFollowAsync(new Follow { FollowerId = followerId, FollowedId = targetId });
+                await _notificationService.EnqueueAggregateEventAsync(new NotificationAggregateEvent
+                {
+                    RecipientId = targetId,
+                    Action = NotificationAggregateActionEnum.Upsert,
+                    Type = NotificationTypeEnum.Follow,
+                    AggregateKey = NotificationAggregateKeys.Follow(followerId),
+                    SourceType = NotificationSourceTypeEnum.FollowRelation,
+                    SourceId = followerId,
+                    ActorId = followerId,
+                    TargetKind = NotificationTargetKindEnum.Account,
+                    TargetId = followerId,
+                    KeepWhenEmpty = false,
+                    OccurredAt = DateTime.UtcNow
+                });
                 
                 // Commit changes first so Count queries see the new data
                 await _unitOfWork.CommitAsync();
@@ -91,6 +126,20 @@ namespace CloudM.Application.Services.FollowServices
             return await _unitOfWork.ExecuteInTransactionAsync(async () =>
             {
                 await _followRepository.RemoveFollowAsync(followerId, targetId);
+                await _notificationService.EnqueueAggregateEventAsync(new NotificationAggregateEvent
+                {
+                    RecipientId = targetId,
+                    Action = NotificationAggregateActionEnum.Deactivate,
+                    Type = NotificationTypeEnum.Follow,
+                    AggregateKey = NotificationAggregateKeys.Follow(followerId),
+                    SourceType = NotificationSourceTypeEnum.FollowRelation,
+                    SourceId = followerId,
+                    ActorId = followerId,
+                    TargetKind = NotificationTargetKindEnum.Account,
+                    TargetId = followerId,
+                    KeepWhenEmpty = false,
+                    OccurredAt = DateTime.UtcNow
+                });
 
                 // Commit changes first
                 await _unitOfWork.CommitAsync();

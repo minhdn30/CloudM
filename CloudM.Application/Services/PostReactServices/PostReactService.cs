@@ -9,6 +9,7 @@ using CloudM.Infrastructure.Repositories.PostReacts;
 using CloudM.Infrastructure.Repositories.Posts;
 using CloudM.Infrastructure.Repositories.Follows;
 using CloudM.Infrastructure.Repositories.UnitOfWork;
+using CloudM.Application.Services.NotificationServices;
 using CloudM.Application.Services.RealtimeServices;
 using static CloudM.Domain.Exceptions.CustomExceptions;
 using System;
@@ -27,19 +28,41 @@ namespace CloudM.Application.Services.PostReactServices
         private readonly IFollowRepository _followRepository;
         private readonly IUnitOfWork _unitOfWork;
         private readonly IMapper _mapper;
+        private readonly INotificationService _notificationService;
         private readonly IRealtimeService _realtimeService;
 
         public PostReactService(IPostReactRepository postReactRepository, ICommentRepository commentRepository, 
             IPostRepository postRepository, IFollowRepository followRepository, IMapper mapper, 
-            IRealtimeService realtimeService, IUnitOfWork unitOfWork)
+            INotificationService notificationService, IRealtimeService realtimeService, IUnitOfWork unitOfWork)
         {
             _postReactRepository = postReactRepository;
             _commentRepository = commentRepository;
             _postRepository = postRepository;
             _followRepository = followRepository;
             _mapper = mapper;
+            _notificationService = notificationService;
             _realtimeService = realtimeService;
             _unitOfWork = unitOfWork;
+        }
+
+        public PostReactService(
+            IPostReactRepository postReactRepository,
+            ICommentRepository commentRepository,
+            IPostRepository postRepository,
+            IFollowRepository followRepository,
+            IMapper mapper,
+            IRealtimeService realtimeService,
+            IUnitOfWork unitOfWork)
+            : this(
+                postReactRepository,
+                commentRepository,
+                postRepository,
+                followRepository,
+                mapper,
+                NullNotificationService.Instance,
+                realtimeService,
+                unitOfWork)
+        {
         }
         public async Task<ReactToggleResponse> ToggleReactOnPost(Guid postId, Guid accountId)
         {
@@ -57,6 +80,23 @@ namespace CloudM.Application.Services.PostReactServices
             {
                 await _postReactRepository.RemovePostReact(existingReact);
                 isReactedByCurrentUser = false;
+                if (post.AccountId != accountId)
+                {
+                    await _notificationService.EnqueueAggregateEventAsync(new NotificationAggregateEvent
+                    {
+                        RecipientId = post.AccountId,
+                        Action = NotificationAggregateActionEnum.Deactivate,
+                        Type = NotificationTypeEnum.PostReact,
+                        AggregateKey = NotificationAggregateKeys.PostReact(postId),
+                        SourceType = NotificationSourceTypeEnum.PostReact,
+                        SourceId = accountId,
+                        ActorId = accountId,
+                        TargetKind = NotificationTargetKindEnum.Post,
+                        TargetId = postId,
+                        KeepWhenEmpty = false,
+                        OccurredAt = DateTime.UtcNow
+                    });
+                }
             }
             else
             {
@@ -69,6 +109,23 @@ namespace CloudM.Application.Services.PostReactServices
                 };
                 await _postReactRepository.AddPostReact(newReact);
                 isReactedByCurrentUser = true;
+                if (post.AccountId != accountId)
+                {
+                    await _notificationService.EnqueueAggregateEventAsync(new NotificationAggregateEvent
+                    {
+                        RecipientId = post.AccountId,
+                        Action = NotificationAggregateActionEnum.Upsert,
+                        Type = NotificationTypeEnum.PostReact,
+                        AggregateKey = NotificationAggregateKeys.PostReact(postId),
+                        SourceType = NotificationSourceTypeEnum.PostReact,
+                        SourceId = accountId,
+                        ActorId = accountId,
+                        TargetKind = NotificationTargetKindEnum.Post,
+                        TargetId = postId,
+                        KeepWhenEmpty = false,
+                        OccurredAt = DateTime.UtcNow
+                    });
+                }
             }
 
             // Must commit before counting to get accurate count from DB

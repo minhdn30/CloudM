@@ -150,6 +150,33 @@ namespace CloudM.API.Services
                     Following = myFollowing
                 });
         }
+
+        public async Task NotifyCurrentUserFollowChangedAsync(Guid currentId, Guid relatedTargetId, string action, int myFollowers, int myFollowing)
+        {
+            await _userHubContext.Clients.Group($"Account-{currentId}")
+                .SendAsync("ReceiveFollowNotification", new
+                {
+                    CurrentId = currentId,
+                    TargetId = currentId,
+                    RelatedTargetId = relatedTargetId,
+                    Action = action,
+                    Followers = myFollowers,
+                    Following = myFollowing
+                });
+        }
+
+        public async Task NotifyFollowStatsChangedAsync(Guid targetId, int targetFollowers, int targetFollowing, string action = "follow_stats_updated")
+        {
+            await _userHubContext.Clients.Group($"Account-{targetId}")
+                .SendAsync("ReceiveFollowNotification", new
+                {
+                    CurrentId = targetId,
+                    TargetId = targetId,
+                    Action = action,
+                    Followers = targetFollowers,
+                    Following = targetFollowing
+                });
+        }
         
         // account notifications
 

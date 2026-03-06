@@ -6,6 +6,8 @@ namespace CloudM.Infrastructure.Repositories.FollowRequests
     {
         Task<bool> IsFollowRequestExistAsync(Guid requesterId, Guid targetId);
         Task AddFollowRequestAsync(FollowRequest followRequest);
-        Task RemoveFollowRequestAsync(Guid requesterId, Guid targetId);
+        Task<bool> AddFollowRequestIgnoreExistingAsync(FollowRequest followRequest, CancellationToken cancellationToken = default);
+        Task<int> RemoveFollowRequestAsync(Guid requesterId, Guid targetId);
+        Task<List<ClaimedAutoAcceptFollowRequest>> ClaimAutoAcceptBatchAsync(int batchSize, CancellationToken cancellationToken = default);
     }
 }

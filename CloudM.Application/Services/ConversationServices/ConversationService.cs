@@ -660,8 +660,8 @@ namespace CloudM.Application.Services.ConversationServices
             if (msg.MessageType == MessageTypeEnum.StoryReply)
             {
                 if (!string.IsNullOrWhiteSpace(content))
-                    return $"Replied to a story: {content}";
-                return "Replied to a story";
+                    return $"Replied to your story: {content}";
+                return "Replied to your story";
             }
 
             if (msg.MessageType == MessageTypeEnum.Media)

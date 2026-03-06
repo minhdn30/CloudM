@@ -18,6 +18,7 @@ using CloudM.Infrastructure.Repositories.Messages;
 using CloudM.Infrastructure.Repositories.Posts;
 using CloudM.Infrastructure.Repositories.Stories;
 using CloudM.Infrastructure.Repositories.UnitOfWork;
+using CloudM.Application.Services.NotificationServices;
 using CloudM.Application.Services.RealtimeServices;
 using Microsoft.Extensions.Options;
 using System;
@@ -49,6 +50,7 @@ namespace CloudM.Application.Services.MessageServices
         private readonly IFileTypeDetector _fileTypeDetector;
         private readonly IStoryRepository _storyRepository;
         private readonly IMapper _mapper;
+        private readonly INotificationService _notificationService;
         private readonly IRealtimeService _realtimeService;
         private readonly IUnitOfWork _unitOfWork;
         private readonly string _groupAllMentionKeyword;
@@ -56,7 +58,7 @@ namespace CloudM.Application.Services.MessageServices
         public MessageService(IMessageRepository messageRepository, IMessageMediaRepository messageMediaRepository,
             IConversationRepository conversationRepository, IConversationMemberRepository conversationMemberRepository,
             IAccountRepository accountRepository, IPostRepository postRepository, IMapper mapper, ICloudinaryService cloudinaryService,
-            IFileTypeDetector fileTypeDetector, IStoryRepository storyRepository, IRealtimeService realtimeService, IUnitOfWork unitOfWork,
+            IFileTypeDetector fileTypeDetector, IStoryRepository storyRepository, INotificationService notificationService, IRealtimeService realtimeService, IUnitOfWork unitOfWork,
             IOptions<ChatMentionOptions>? chatMentionOptions = null)
         {
             _messageRepository = messageRepository;
@@ -69,9 +71,33 @@ namespace CloudM.Application.Services.MessageServices
             _fileTypeDetector = fileTypeDetector;
             _storyRepository = storyRepository;
             _mapper = mapper;
+            _notificationService = notificationService;
             _realtimeService = realtimeService;
             _unitOfWork = unitOfWork;
             _groupAllMentionKeyword = NormalizeGroupAllKeyword(chatMentionOptions?.Value?.GroupAllKeyword);
+        }
+
+        public MessageService(IMessageRepository messageRepository, IMessageMediaRepository messageMediaRepository,
+            IConversationRepository conversationRepository, IConversationMemberRepository conversationMemberRepository,
+            IAccountRepository accountRepository, IPostRepository postRepository, IMapper mapper, ICloudinaryService cloudinaryService,
+            IFileTypeDetector fileTypeDetector, IStoryRepository storyRepository, IRealtimeService realtimeService, IUnitOfWork unitOfWork,
+            IOptions<ChatMentionOptions>? chatMentionOptions = null)
+            : this(
+                messageRepository,
+                messageMediaRepository,
+                conversationRepository,
+                conversationMemberRepository,
+                accountRepository,
+                postRepository,
+                mapper,
+                cloudinaryService,
+                fileTypeDetector,
+                storyRepository,
+                NullNotificationService.Instance,
+                realtimeService,
+                unitOfWork,
+                chatMentionOptions)
+        {
         }
 
         public async Task<CursorResponse<MessageBasicModel>> GetMessagesByConversationIdAsync(Guid conversationId, Guid currentId, string? cursor, int pageSize)
@@ -491,6 +517,38 @@ namespace CloudM.Application.Services.MessageServices
             message.IsRecalled = true;
             message.RecalledAt = DateTime.UtcNow;
 
+            if (message.MessageType == MessageTypeEnum.StoryReply)
+            {
+                var storyId = TryExtractStoryIdFromStoryReplySnapshot(message.SystemMessageDataJson);
+                if (storyId != Guid.Empty)
+                {
+                    var conversationMembers = await _conversationMemberRepository.GetConversationMembersAsync(message.ConversationId);
+                    var recipientIds = conversationMembers
+                        .Select(x => x.AccountId)
+                        .Where(x => x != Guid.Empty && x != currentId)
+                        .Distinct()
+                        .ToList();
+
+                    foreach (var recipientId in recipientIds)
+                    {
+                        await _notificationService.EnqueueAggregateEventAsync(new NotificationAggregateEvent
+                        {
+                            RecipientId = recipientId,
+                            Action = NotificationAggregateActionEnum.Deactivate,
+                            Type = NotificationTypeEnum.StoryReply,
+                            AggregateKey = NotificationAggregateKeys.StoryReply(storyId),
+                            SourceType = NotificationSourceTypeEnum.StoryReplyMessage,
+                            SourceId = message.MessageId,
+                            ActorId = currentId,
+                            TargetKind = NotificationTargetKindEnum.Story,
+                            TargetId = storyId,
+                            KeepWhenEmpty = false,
+                            OccurredAt = message.RecalledAt.Value
+                        });
+                    }
+                }
+            }
+
             await _unitOfWork.CommitAsync();
 
             await _realtimeService.NotifyMessageRecalledAsync(
@@ -580,6 +638,23 @@ namespace CloudM.Application.Services.MessageServices
                         SystemMessageDataJson = storySnapshot
                     };
                     await _messageRepository.AddMessageAsync(message);
+                    if (request.ReceiverId != senderId)
+                    {
+                        await _notificationService.EnqueueAggregateEventAsync(new NotificationAggregateEvent
+                        {
+                            RecipientId = request.ReceiverId,
+                            Action = NotificationAggregateActionEnum.Upsert,
+                            Type = NotificationTypeEnum.StoryReply,
+                            AggregateKey = NotificationAggregateKeys.StoryReply(story.StoryId),
+                            SourceType = NotificationSourceTypeEnum.StoryReplyMessage,
+                            SourceId = message.MessageId,
+                            ActorId = senderId,
+                            TargetKind = NotificationTargetKindEnum.Story,
+                            TargetId = story.StoryId,
+                            KeepWhenEmpty = false,
+                            OccurredAt = DateTime.UtcNow
+                        });
+                    }
 
                     // Build response
                     var result = _mapper.Map<SendMessageResponse>(message);
@@ -1462,6 +1537,43 @@ namespace CloudM.Application.Services.MessageServices
             }
 
             return normalized.Trim().ToLowerInvariant();
+        }
+
+        private static Guid TryExtractStoryIdFromStoryReplySnapshot(string? storySnapshotJson)
+        {
+            if (string.IsNullOrWhiteSpace(storySnapshotJson))
+            {
+                return Guid.Empty;
+            }
+
+            try
+            {
+                using var doc = JsonDocument.Parse(storySnapshotJson);
+                var root = doc.RootElement;
+                if (!root.TryGetProperty("storyId", out var storyIdProp))
+                {
+                    return Guid.Empty;
+                }
+
+                if (storyIdProp.ValueKind == JsonValueKind.String &&
+                    Guid.TryParse(storyIdProp.GetString(), out var storyIdFromString))
+                {
+                    return storyIdFromString;
+                }
+
+                if (storyIdProp.ValueKind == JsonValueKind.Object ||
+                    storyIdProp.ValueKind == JsonValueKind.Array)
+                {
+                    return Guid.Empty;
+                }
+
+                var raw = storyIdProp.ToString();
+                return Guid.TryParse(raw, out var storyIdFromRaw) ? storyIdFromRaw : Guid.Empty;
+            }
+            catch
+            {
+                return Guid.Empty;
+            }
         }
 
         private static Account? ResolveMentionTargetAccount(

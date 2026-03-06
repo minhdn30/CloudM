@@ -10,6 +10,7 @@ using CloudM.Application.Helpers.FileTypeHelpers;
 using CloudM.Application.Helpers.StoryHelpers;
 using CloudM.Application.Helpers.SwaggerHelpers;
 using CloudM.Infrastructure.Services.Cloudinary;
+using CloudM.Application.Services.NotificationServices;
 using CloudM.Application.Services.RealtimeServices;
 using CloudM.Application.Services.StoryViewServices;
 using CloudM.Domain.Entities;
@@ -49,6 +50,7 @@ namespace CloudM.Application.Services.PostServices
         private readonly IFileTypeDetector _fileTypeDetector;
         private readonly IMapper _mapper;
         private readonly IUnitOfWork _unitOfWork;
+        private readonly INotificationService _notificationService;
         private readonly IRealtimeService _realtimeService;
         private readonly IStoryRingStateHelper _storyRingStateHelper;
         public PostService(IPostReactRepository postReactRepository,
@@ -62,6 +64,7 @@ namespace CloudM.Application.Services.PostServices
                            IFileTypeDetector fileTypeDetector,
                            IMapper mapper,
                            IUnitOfWork unitOfWork,
+                           INotificationService notificationService,
                            IRealtimeService realtimeService,
                            IStoryViewService storyViewService,
                            IStoryRingStateHelper? storyRingStateHelper = null)
@@ -77,9 +80,44 @@ namespace CloudM.Application.Services.PostServices
             _fileTypeDetector = fileTypeDetector;
             _mapper = mapper;
             _unitOfWork = unitOfWork;
+            _notificationService = notificationService;
             _realtimeService = realtimeService;
             _storyRingStateHelper = storyRingStateHelper ?? new StoryRingStateHelper(storyViewService);
         }
+
+        public PostService(IPostReactRepository postReactRepository,
+                           IPostSaveRepository postSaveRepository,
+                           IPostMediaRepository postMediaRepository,
+                           IPostRepository postRepository,
+                           ICommentRepository commentRepository,
+                           IAccountRepository accountRepository,
+                           IFollowRepository followRepository,
+                           ICloudinaryService cloudinaryService,
+                           IFileTypeDetector fileTypeDetector,
+                           IMapper mapper,
+                           IUnitOfWork unitOfWork,
+                           IRealtimeService realtimeService,
+                           IStoryViewService storyViewService,
+                           IStoryRingStateHelper? storyRingStateHelper = null)
+            : this(
+                postReactRepository,
+                postSaveRepository,
+                postMediaRepository,
+                postRepository,
+                commentRepository,
+                accountRepository,
+                followRepository,
+                cloudinaryService,
+                fileTypeDetector,
+                mapper,
+                unitOfWork,
+                NullNotificationService.Instance,
+                realtimeService,
+                storyViewService,
+                storyRingStateHelper)
+        {
+        }
+
         public async Task<PostDetailResponse?> GetPostById(Guid postId, Guid? currentId)
         {
             var post = await _postRepository.GetPostById(postId);
@@ -250,6 +288,15 @@ namespace CloudM.Application.Services.PostServices
                         }
 
                         await _postRepository.AddPost(post);
+                        if (normalizedTagIds.Count > 0)
+                        {
+                            await EnqueuePostTagEventsAsync(
+                                post.PostId,
+                                accountId,
+                                normalizedTagIds,
+                                NotificationAggregateActionEnum.Upsert,
+                                DateTime.UtcNow);
+                        }
 
                         // Commit explicitly before sending notification to ensure data availability
                         await _unitOfWork.CommitAsync();
@@ -442,6 +489,12 @@ namespace CloudM.Application.Services.PostServices
                 if (removeTagIds.Count > 0)
                 {
                     await _postRepository.RemovePostTagsAsync(postId, removeTagIds);
+                    await EnqueuePostTagEventsAsync(
+                        postId,
+                        post.AccountId,
+                        removeTagIds,
+                        NotificationAggregateActionEnum.Deactivate,
+                        DateTime.UtcNow);
                     hasTagChanged = true;
                 }
 
@@ -458,6 +511,12 @@ namespace CloudM.Application.Services.PostServices
                         .ToList();
 
                     await _postRepository.AddPostTagsAsync(newTags);
+                    await EnqueuePostTagEventsAsync(
+                        postId,
+                        post.AccountId,
+                        addTagIds,
+                        NotificationAggregateActionEnum.Upsert,
+                        DateTime.UtcNow);
                     hasTagChanged = true;
                 }
             }
@@ -506,6 +565,7 @@ namespace CloudM.Application.Services.PostServices
             }
 
             await _postRepository.SoftDeletePostAsync(postId);
+            await EnqueuePostTargetUnavailableEventsAsync(postId, currentId, DateTime.UtcNow);
             await _unitOfWork.CommitAsync();
 
             // Send realtime notification
@@ -768,6 +828,75 @@ namespace CloudM.Application.Services.PostServices
                     IsFollower = false
                 })
                 .ToList();
+        }
+
+        private async Task EnqueuePostTagEventsAsync(
+            Guid postId,
+            Guid ownerId,
+            IEnumerable<Guid> recipientIds,
+            NotificationAggregateActionEnum action,
+            DateTime occurredAt)
+        {
+            var recipients = (recipientIds ?? Enumerable.Empty<Guid>())
+                .Where(x => x != Guid.Empty && x != ownerId)
+                .Distinct()
+                .ToList();
+            if (recipients.Count == 0)
+            {
+                return;
+            }
+
+            foreach (var recipientId in recipients)
+            {
+                await _notificationService.EnqueueAggregateEventAsync(new NotificationAggregateEvent
+                {
+                    RecipientId = recipientId,
+                    Action = action,
+                    Type = NotificationTypeEnum.PostTag,
+                    AggregateKey = NotificationAggregateKeys.PostTag(postId),
+                    SourceType = NotificationSourceTypeEnum.PostTag,
+                    SourceId = postId,
+                    ActorId = ownerId,
+                    TargetKind = NotificationTargetKindEnum.Post,
+                    TargetId = postId,
+                    KeepWhenEmpty = true,
+                    OccurredAt = occurredAt
+                });
+            }
+        }
+
+        private async Task EnqueuePostTargetUnavailableEventsAsync(Guid postId, Guid initiatorId, DateTime occurredAt)
+        {
+            await _notificationService.EnqueueTargetUnavailableForExistingRecipientsAsync(
+                NotificationTypeEnum.PostComment,
+                NotificationTargetKindEnum.Post,
+                postId,
+                initiatorId,
+                occurredAt);
+            await _notificationService.EnqueueTargetUnavailableForExistingRecipientsAsync(
+                NotificationTypeEnum.CommentReply,
+                NotificationTargetKindEnum.Post,
+                postId,
+                initiatorId,
+                occurredAt);
+            await _notificationService.EnqueueTargetUnavailableForExistingRecipientsAsync(
+                NotificationTypeEnum.CommentMention,
+                NotificationTargetKindEnum.Post,
+                postId,
+                initiatorId,
+                occurredAt);
+            await _notificationService.EnqueueTargetUnavailableForExistingRecipientsAsync(
+                NotificationTypeEnum.PostTag,
+                NotificationTargetKindEnum.Post,
+                postId,
+                initiatorId,
+                occurredAt);
+            await _notificationService.EnqueueTargetUnavailableForExistingRecipientsAsync(
+                NotificationTypeEnum.PostReact,
+                NotificationTargetKindEnum.Post,
+                postId,
+                initiatorId,
+                occurredAt);
         }
     }
 }

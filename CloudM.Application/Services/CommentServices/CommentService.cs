@@ -13,6 +13,7 @@ using CloudM.Infrastructure.Repositories.Comments;
 using CloudM.Infrastructure.Repositories.Follows;
 using CloudM.Infrastructure.Repositories.Posts;
 using CloudM.Infrastructure.Repositories.UnitOfWork;
+using CloudM.Application.Services.NotificationServices;
 using CloudM.Application.Services.RealtimeServices;
 using CloudM.Application.Services.StoryViewServices;
 using System;
@@ -34,12 +35,13 @@ namespace CloudM.Application.Services.CommentServices
         private readonly IAccountRepository _accountRepository;
         private readonly IFollowRepository _followRepository;
         private readonly IMapper _mapper;
+        private readonly INotificationService _notificationService;
         private readonly IRealtimeService _realtimeService;
         private readonly IUnitOfWork _unitOfWork;
         private readonly IStoryRingStateHelper _storyRingStateHelper;
 
         public CommentService(ICommentRepository commentRepository, ICommentReactRepository commentReactRepository, IPostRepository postRepository,
-            IAccountRepository accountRepository, IFollowRepository followRepository, IMapper mapper, IRealtimeService realtimeService,
+            IAccountRepository accountRepository, IFollowRepository followRepository, IMapper mapper, INotificationService notificationService, IRealtimeService realtimeService,
             IUnitOfWork unitOfWork, IStoryViewService? storyViewService = null, IStoryRingStateHelper? storyRingStateHelper = null)
         {
             _commentRepository = commentRepository;
@@ -48,9 +50,36 @@ namespace CloudM.Application.Services.CommentServices
             _accountRepository = accountRepository;
             _followRepository = followRepository;
             _mapper = mapper;
+            _notificationService = notificationService;
             _realtimeService = realtimeService;
             _unitOfWork = unitOfWork;
             _storyRingStateHelper = storyRingStateHelper ?? new StoryRingStateHelper(storyViewService);
+        }
+
+        public CommentService(
+            ICommentRepository commentRepository,
+            ICommentReactRepository commentReactRepository,
+            IPostRepository postRepository,
+            IAccountRepository accountRepository,
+            IFollowRepository followRepository,
+            IMapper mapper,
+            IRealtimeService realtimeService,
+            IUnitOfWork unitOfWork,
+            IStoryViewService? storyViewService = null,
+            IStoryRingStateHelper? storyRingStateHelper = null)
+            : this(
+                commentRepository,
+                commentReactRepository,
+                postRepository,
+                accountRepository,
+                followRepository,
+                mapper,
+                NullNotificationService.Instance,
+                realtimeService,
+                unitOfWork,
+                storyViewService,
+                storyRingStateHelper)
+        {
         }
 
         public async Task<CommentResponse> AddCommentAsync(Guid postId, Guid accountId, CommentCreateRequest request)
@@ -71,14 +100,14 @@ namespace CloudM.Application.Services.CommentServices
 
             if (account.Status != AccountStatusEnum.Active)
                 throw new ForbiddenException("You must reactivate your account to comment.");
+            Comment? parentComment = null;
             if (request.ParentCommentId.HasValue)
             {
                 var parentId = request.ParentCommentId.Value;
-
-                if (!await _commentRepository.IsCommentExist(parentId) ||
-                    !await _commentRepository.IsCommentCanReply(parentId))
+                parentComment = await _commentRepository.GetCommentById(parentId);
+                if (parentComment == null || parentComment.ParentCommentId != null)
                 {
-                    var message = !await _commentRepository.IsCommentExist(parentId)
+                    var message = parentComment == null
                         ? $"Parent comment with ID {parentId} not found."
                         : "Cannot reply to a reply. Only one level of reply is allowed.";
 
@@ -89,12 +118,21 @@ namespace CloudM.Application.Services.CommentServices
             var comment = _mapper.Map<Comment>(request);
             comment.PostId = postId;
             comment.AccountId = accountId;
-            comment.Content = await SanitizeMentionsAsync(comment.Content, post);
+            var sanitizeResult = await SanitizeMentionsAsync(comment.Content, post);
+            comment.Content = sanitizeResult.SanitizedContent;
 
             return await _unitOfWork.ExecuteInTransactionAsync(async () =>
             {
                 await _commentRepository.AddComment(comment);
                 await _unitOfWork.CommitAsync(); // Physical save needed for IDs and Counts
+
+                var notificationAt = DateTime.UtcNow;
+                await EnqueueCommentCreatedNotificationsAsync(
+                    comment,
+                    post,
+                    parentComment,
+                    sanitizeResult.MentionedAccountIds,
+                    notificationAt);
 
                 var result = _mapper.Map<CommentResponse>(comment);
 
@@ -148,8 +186,43 @@ namespace CloudM.Application.Services.CommentServices
             await ValidatePostPrivacyAsync(post, accountId, "modify comments on");
 
             // Only update content as requested
-            comment.Content = await SanitizeMentionsAsync(request.Content, post);
+            var previousMentionAccountIds = ExtractCanonicalMentionAccountIds(comment.Content);
+            var sanitizeResult = await SanitizeMentionsAsync(request.Content, post);
+            comment.Content = sanitizeResult.SanitizedContent;
             comment.UpdatedAt = DateTime.UtcNow;
+
+            var addedMentionAccountIds = sanitizeResult.MentionedAccountIds
+                .Where(x => !previousMentionAccountIds.Contains(x))
+                .Distinct()
+                .ToList();
+            var removedMentionAccountIds = previousMentionAccountIds
+                .Where(x => !sanitizeResult.MentionedAccountIds.Contains(x))
+                .Distinct()
+                .ToList();
+
+            if (addedMentionAccountIds.Count > 0)
+            {
+                await EnqueueCommentMentionNotificationsAsync(
+                    comment.CommentId,
+                    comment.PostId,
+                    accountId,
+                    addedMentionAccountIds,
+                    NotificationAggregateActionEnum.Upsert,
+                    DateTime.UtcNow,
+                    keepWhenEmpty: false);
+            }
+
+            if (removedMentionAccountIds.Count > 0)
+            {
+                await EnqueueCommentMentionNotificationsAsync(
+                    comment.CommentId,
+                    comment.PostId,
+                    accountId,
+                    removedMentionAccountIds,
+                    NotificationAggregateActionEnum.Deactivate,
+                    DateTime.UtcNow,
+                    keepWhenEmpty: false);
+            }
 
             await _commentRepository.UpdateComment(comment);
             await _unitOfWork.CommitAsync();
@@ -208,6 +281,35 @@ namespace CloudM.Application.Services.CommentServices
 
             var postId = comment.PostId;
             var parentId = comment.ParentCommentId;
+            var commentThread = await _commentRepository.GetCommentThreadForDeleteAsync(commentId) ?? new List<Comment>();
+            if (commentThread.Count == 0)
+            {
+                commentThread = new List<Comment> { comment };
+            }
+
+            var threadOwnerMap = commentThread
+                .GroupBy(x => x.CommentId)
+                .ToDictionary(x => x.Key, x => x.First().AccountId);
+            var parentOwnerMap = new Dictionary<Guid, Guid>();
+            var parentIds = commentThread
+                .Where(x => x.ParentCommentId.HasValue)
+                .Select(x => x.ParentCommentId!.Value)
+                .Distinct()
+                .ToList();
+            foreach (var parentCommentId in parentIds)
+            {
+                if (threadOwnerMap.TryGetValue(parentCommentId, out var ownerInThread))
+                {
+                    parentOwnerMap[parentCommentId] = ownerInThread;
+                    continue;
+                }
+
+                var parentComment = await _commentRepository.GetCommentById(parentCommentId);
+                if (parentComment != null)
+                {
+                    parentOwnerMap[parentCommentId] = parentComment.AccountId;
+                }
+            }
 
             return await _unitOfWork.ExecuteInTransactionAsync(async () =>
             {
@@ -215,6 +317,64 @@ namespace CloudM.Application.Services.CommentServices
                 
                 // Commit changes first
                 await _unitOfWork.CommitAsync();
+
+                var notificationAt = DateTime.UtcNow;
+                foreach (var deletedComment in commentThread)
+                {
+                    if (deletedComment.ParentCommentId.HasValue)
+                    {
+                        var deletedParentId = deletedComment.ParentCommentId.Value;
+                        if (parentOwnerMap.TryGetValue(deletedParentId, out var parentOwnerId) &&
+                            parentOwnerId != Guid.Empty &&
+                            parentOwnerId != deletedComment.AccountId)
+                        {
+                            await _notificationService.EnqueueAggregateEventAsync(new NotificationAggregateEvent
+                            {
+                                RecipientId = parentOwnerId,
+                                Action = NotificationAggregateActionEnum.Deactivate,
+                                Type = NotificationTypeEnum.CommentReply,
+                                AggregateKey = NotificationAggregateKeys.CommentReply(deletedParentId),
+                                SourceType = NotificationSourceTypeEnum.Reply,
+                                SourceId = deletedComment.CommentId,
+                                ActorId = deletedComment.AccountId,
+                                TargetKind = NotificationTargetKindEnum.Post,
+                                TargetId = deletedComment.PostId,
+                                KeepWhenEmpty = true,
+                                OccurredAt = notificationAt
+                            });
+                        }
+                    }
+                    else if (post.AccountId != deletedComment.AccountId)
+                    {
+                        await _notificationService.EnqueueAggregateEventAsync(new NotificationAggregateEvent
+                        {
+                            RecipientId = post.AccountId,
+                            Action = NotificationAggregateActionEnum.Deactivate,
+                            Type = NotificationTypeEnum.PostComment,
+                            AggregateKey = NotificationAggregateKeys.PostComment(deletedComment.PostId),
+                            SourceType = NotificationSourceTypeEnum.Comment,
+                            SourceId = deletedComment.CommentId,
+                            ActorId = deletedComment.AccountId,
+                            TargetKind = NotificationTargetKindEnum.Post,
+                            TargetId = deletedComment.PostId,
+                            KeepWhenEmpty = true,
+                            OccurredAt = notificationAt
+                        });
+                    }
+
+                    var deletedMentionRecipients = ExtractCanonicalMentionAccountIds(deletedComment.Content);
+                    if (deletedMentionRecipients.Count > 0)
+                    {
+                        await EnqueueCommentMentionNotificationsAsync(
+                            deletedComment.CommentId,
+                            deletedComment.PostId,
+                            deletedComment.AccountId,
+                            deletedMentionRecipients,
+                            NotificationAggregateActionEnum.Deactivate,
+                            notificationAt,
+                            keepWhenEmpty: true);
+                    }
+                }
 
                 // Get updated counts logic
                 int? totalComments = null;
@@ -367,13 +527,16 @@ namespace CloudM.Application.Services.CommentServices
             return await _storyRingStateHelper.ResolveAsync(currentId, targetAccountId);
         }
 
-        private async Task<string> SanitizeMentionsAsync(string? content, Post post)
+        private async Task<CommentMentionSanitizeResult> SanitizeMentionsAsync(string? content, Post post)
         {
             var safeContent = content ?? string.Empty;
             var mentionTokens = MentionParser.ExtractTokens(safeContent);
             if (mentionTokens.Count == 0)
             {
-                return safeContent;
+                return new CommentMentionSanitizeResult
+                {
+                    SanitizedContent = safeContent
+                };
             }
 
             var canonicalMentionAccountIds = mentionTokens
@@ -423,6 +586,7 @@ namespace CloudM.Application.Services.CommentServices
 
             var builder = new StringBuilder();
             var currentIndex = 0;
+            var mentionedAccountIds = new HashSet<Guid>();
             foreach (var token in mentionTokens)
             {
                 if (token.StartIndex > currentIndex)
@@ -434,6 +598,7 @@ namespace CloudM.Application.Services.CommentServices
                 if (resolvedAccount != null && IsMentionAllowedByBusinessRules(resolvedAccount, post, followOnlyVisibleAccountIds))
                 {
                     builder.Append(MentionParser.BuildCanonicalMentionText(resolvedAccount.Username, resolvedAccount.AccountId));
+                    mentionedAccountIds.Add(resolvedAccount.AccountId);
                 }
                 else
                 {
@@ -448,7 +613,11 @@ namespace CloudM.Application.Services.CommentServices
                 builder.Append(safeContent.AsSpan(currentIndex));
             }
 
-            return builder.ToString();
+            return new CommentMentionSanitizeResult
+            {
+                SanitizedContent = builder.ToString(),
+                MentionedAccountIds = mentionedAccountIds
+            };
         }
 
         private static Account? ResolveMentionTargetAccount(
@@ -498,6 +667,116 @@ namespace CloudM.Application.Services.CommentServices
             }
 
             return false;
+        }
+
+        private async Task EnqueueCommentCreatedNotificationsAsync(
+            Comment comment,
+            Post post,
+            Comment? parentComment,
+            IReadOnlyCollection<Guid> mentionedAccountIds,
+            DateTime occurredAt)
+        {
+            if (comment.ParentCommentId.HasValue)
+            {
+                var parentOwnerId = parentComment?.AccountId ?? Guid.Empty;
+                if (parentOwnerId != Guid.Empty && parentOwnerId != comment.AccountId)
+                {
+                    await _notificationService.EnqueueAggregateEventAsync(new NotificationAggregateEvent
+                    {
+                        RecipientId = parentOwnerId,
+                        Action = NotificationAggregateActionEnum.Upsert,
+                        Type = NotificationTypeEnum.CommentReply,
+                        AggregateKey = NotificationAggregateKeys.CommentReply(comment.ParentCommentId.Value),
+                        SourceType = NotificationSourceTypeEnum.Reply,
+                        SourceId = comment.CommentId,
+                        ActorId = comment.AccountId,
+                        TargetKind = NotificationTargetKindEnum.Post,
+                        TargetId = comment.PostId,
+                        KeepWhenEmpty = true,
+                        OccurredAt = occurredAt
+                    });
+                }
+            }
+            else if (post.AccountId != comment.AccountId)
+            {
+                await _notificationService.EnqueueAggregateEventAsync(new NotificationAggregateEvent
+                {
+                    RecipientId = post.AccountId,
+                    Action = NotificationAggregateActionEnum.Upsert,
+                    Type = NotificationTypeEnum.PostComment,
+                    AggregateKey = NotificationAggregateKeys.PostComment(comment.PostId),
+                    SourceType = NotificationSourceTypeEnum.Comment,
+                    SourceId = comment.CommentId,
+                    ActorId = comment.AccountId,
+                    TargetKind = NotificationTargetKindEnum.Post,
+                    TargetId = comment.PostId,
+                    KeepWhenEmpty = true,
+                    OccurredAt = occurredAt
+                });
+            }
+
+            if (mentionedAccountIds.Count > 0)
+            {
+                await EnqueueCommentMentionNotificationsAsync(
+                    comment.CommentId,
+                    comment.PostId,
+                    comment.AccountId,
+                    mentionedAccountIds,
+                    NotificationAggregateActionEnum.Upsert,
+                    occurredAt,
+                    keepWhenEmpty: false);
+            }
+        }
+
+        private async Task EnqueueCommentMentionNotificationsAsync(
+            Guid commentId,
+            Guid postId,
+            Guid actorId,
+            IEnumerable<Guid> recipients,
+            NotificationAggregateActionEnum action,
+            DateTime occurredAt,
+            bool keepWhenEmpty)
+        {
+            var normalizedRecipients = (recipients ?? Enumerable.Empty<Guid>())
+                .Where(x => x != Guid.Empty && x != actorId)
+                .Distinct()
+                .ToList();
+            if (normalizedRecipients.Count == 0)
+            {
+                return;
+            }
+
+            foreach (var recipientId in normalizedRecipients)
+            {
+                await _notificationService.EnqueueAggregateEventAsync(new NotificationAggregateEvent
+                {
+                    RecipientId = recipientId,
+                    Action = action,
+                    Type = NotificationTypeEnum.CommentMention,
+                    AggregateKey = NotificationAggregateKeys.CommentMention(commentId),
+                    SourceType = NotificationSourceTypeEnum.Mention,
+                    SourceId = commentId,
+                    ActorId = actorId,
+                    TargetKind = NotificationTargetKindEnum.Post,
+                    TargetId = postId,
+                    KeepWhenEmpty = keepWhenEmpty,
+                    OccurredAt = occurredAt
+                });
+            }
+        }
+
+        private static HashSet<Guid> ExtractCanonicalMentionAccountIds(string? content)
+        {
+            return MentionParser.ExtractTokens(content)
+                .Where(x => x.IsCanonical && x.AccountId.HasValue && x.AccountId.Value != Guid.Empty)
+                .Select(x => x.AccountId!.Value)
+                .ToHashSet();
+        }
+
+        private sealed class CommentMentionSanitizeResult
+        {
+            public string SanitizedContent { get; set; } = string.Empty;
+            public HashSet<Guid> MentionedAccountIds { get; set; } = new();
         }
     }
 }

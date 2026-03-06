@@ -9,6 +9,7 @@ using CloudM.Infrastructure.Repositories.Stories;
 using CloudM.Infrastructure.Repositories.StoryHighlights;
 using CloudM.Infrastructure.Repositories.StoryViews;
 using CloudM.Infrastructure.Repositories.UnitOfWork;
+using CloudM.Application.Services.NotificationServices;
 using CloudM.Infrastructure.Services.Cloudinary;
 using static CloudM.Domain.Exceptions.CustomExceptions;
 
@@ -30,6 +31,29 @@ namespace CloudM.Application.Services.StoryServices
         private readonly IFileTypeDetector _fileTypeDetector;
         private readonly IUnitOfWork _unitOfWork;
         private readonly IMapper _mapper;
+        private readonly INotificationService _notificationService;
+
+        public StoryService(
+            IStoryRepository storyRepository,
+            IStoryHighlightRepository storyHighlightRepository,
+            IStoryViewRepository storyViewRepository,
+            IAccountRepository accountRepository,
+            ICloudinaryService cloudinaryService,
+            IFileTypeDetector fileTypeDetector,
+            IUnitOfWork unitOfWork,
+            IMapper mapper,
+            INotificationService notificationService)
+        {
+            _storyRepository = storyRepository;
+            _storyHighlightRepository = storyHighlightRepository;
+            _storyViewRepository = storyViewRepository;
+            _accountRepository = accountRepository;
+            _cloudinaryService = cloudinaryService;
+            _fileTypeDetector = fileTypeDetector;
+            _unitOfWork = unitOfWork;
+            _mapper = mapper;
+            _notificationService = notificationService;
+        }
 
         public StoryService(
             IStoryRepository storyRepository,
@@ -40,15 +64,17 @@ namespace CloudM.Application.Services.StoryServices
             IFileTypeDetector fileTypeDetector,
             IUnitOfWork unitOfWork,
             IMapper mapper)
+            : this(
+                storyRepository,
+                storyHighlightRepository,
+                storyViewRepository,
+                accountRepository,
+                cloudinaryService,
+                fileTypeDetector,
+                unitOfWork,
+                mapper,
+                NullNotificationService.Instance)
         {
-            _storyRepository = storyRepository;
-            _storyHighlightRepository = storyHighlightRepository;
-            _storyViewRepository = storyViewRepository;
-            _accountRepository = accountRepository;
-            _cloudinaryService = cloudinaryService;
-            _fileTypeDetector = fileTypeDetector;
-            _unitOfWork = unitOfWork;
-            _mapper = mapper;
         }
 
         public async Task<PagedResponse<StoryAuthorItemResponse>> GetViewableAuthorsAsync(Guid currentId, int page, int pageSize)
@@ -444,6 +470,18 @@ namespace CloudM.Application.Services.StoryServices
             {
                 story.IsDeleted = true;
                 await _storyRepository.UpdateStoryAsync(story);
+                await _notificationService.EnqueueTargetUnavailableForExistingRecipientsAsync(
+                    NotificationTypeEnum.StoryReply,
+                    NotificationTargetKindEnum.Story,
+                    storyId,
+                    currentId,
+                    DateTime.UtcNow);
+                await _notificationService.EnqueueTargetUnavailableForExistingRecipientsAsync(
+                    NotificationTypeEnum.StoryReact,
+                    NotificationTargetKindEnum.Story,
+                    storyId,
+                    currentId,
+                    DateTime.UtcNow);
                 await _unitOfWork.CommitAsync();
 
                 var candidateGroups = await _storyHighlightRepository

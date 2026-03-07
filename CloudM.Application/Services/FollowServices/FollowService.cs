@@ -423,6 +423,32 @@ namespace CloudM.Application.Services.FollowServices
             };
         }
 
+        public async Task<PagedResponse<AccountWithFollowStatusModel>> GetSentPendingRequestsAsync(Guid currentId, FollowPagingRequest request)
+        {
+            if (!await _accountRepository.IsAccountIdExist(currentId))
+            {
+                throw new ForbiddenException("You must reactivate your account to view sent follow requests.");
+            }
+
+            var safeRequest = request ?? new FollowPagingRequest();
+            var safePage = safeRequest.Page <= 0 ? 1 : safeRequest.Page;
+            var safePageSize = safeRequest.PageSize <= 0 ? 20 : Math.Min(safeRequest.PageSize, 50);
+            var (items, total) = await _followRequestRepository.GetPendingSentByRequesterAsync(
+                currentId,
+                safeRequest.Keyword,
+                safeRequest.SortByCreatedASC,
+                safePage,
+                safePageSize);
+
+            return new PagedResponse<AccountWithFollowStatusModel>
+            {
+                Items = items,
+                TotalItems = total,
+                Page = safePage,
+                PageSize = safePageSize
+            };
+        }
+
         public async Task AcceptFollowRequestAsync(Guid targetId, Guid requesterId)
         {
             if (targetId == requesterId)

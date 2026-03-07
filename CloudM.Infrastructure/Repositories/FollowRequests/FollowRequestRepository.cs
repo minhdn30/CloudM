@@ -1,6 +1,7 @@
 using CloudM.Domain.Entities;
 using CloudM.Domain.Enums;
 using CloudM.Infrastructure.Data;
+using CloudM.Infrastructure.Models;
 using Microsoft.EntityFrameworkCore;
 using Npgsql;
 using NpgsqlTypes;
@@ -113,6 +114,67 @@ ON CONFLICT (""RequesterId"", ""TargetId"") DO NOTHING;",
             }
 
             return (items, nextCursorCreatedAt, nextCursorRequesterId);
+        }
+
+        public async Task<(List<AccountWithFollowStatusModel> Items, int TotalItems)> GetPendingSentByRequesterAsync(
+            Guid requesterId,
+            string? keyword,
+            bool? sortByCreatedASC,
+            int page,
+            int pageSize)
+        {
+            var safePage = page <= 0 ? 1 : page;
+            var safePageSize = pageSize <= 0 ? 20 : Math.Min(pageSize, 50);
+
+            var query = _context.FollowRequests
+                .Where(fr => fr.RequesterId == requesterId && fr.Target.Status == AccountStatusEnum.Active)
+                .Select(fr => new
+                {
+                    fr.TargetId,
+                    fr.Target.Username,
+                    fr.Target.FullName,
+                    fr.Target.AvatarUrl,
+                    fr.CreatedAt,
+                    IsFollower = _context.Follows.Any(f => f.FollowerId == fr.TargetId && f.FollowedId == requesterId)
+                });
+
+            if (!string.IsNullOrWhiteSpace(keyword))
+            {
+                var words = keyword.Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                foreach (var word in words)
+                {
+                    var searchPattern = $"%{word}%";
+                    query = query.Where(x =>
+                        EF.Functions.ILike(AppDbContext.Unaccent(x.FullName), AppDbContext.Unaccent(searchPattern)) ||
+                        EF.Functions.ILike(x.Username, searchPattern));
+                }
+            }
+
+            var totalItems = await query.CountAsync();
+
+            var sortedQuery = sortByCreatedASC.HasValue
+                ? (sortByCreatedASC.Value
+                    ? query.OrderBy(x => x.CreatedAt)
+                    : query.OrderByDescending(x => x.CreatedAt))
+                : query.OrderByDescending(x => x.CreatedAt)
+                    .ThenBy(x => x.Username);
+
+            var items = await sortedQuery
+                .Skip((safePage - 1) * safePageSize)
+                .Take(safePageSize)
+                .Select(x => new AccountWithFollowStatusModel
+                {
+                    AccountId = x.TargetId,
+                    Username = x.Username,
+                    FullName = x.FullName,
+                    AvatarUrl = x.AvatarUrl,
+                    IsFollowing = false,
+                    IsFollowRequested = true,
+                    IsFollower = x.IsFollower
+                })
+                .ToListAsync();
+
+            return (items, totalItems);
         }
 
         public async Task<int> GetPendingCountByTargetAsync(Guid targetId, CancellationToken cancellationToken = default)

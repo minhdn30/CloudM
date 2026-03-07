@@ -94,6 +94,23 @@ namespace CloudM.API.Controllers
         }
 
         [Authorize]
+        [HttpGet("requests/sent")]
+        public async Task<IActionResult> GetSentFollowRequests([FromQuery] FollowPagingRequest request)
+        {
+            var currentId = User.GetAccountId();
+            if (currentId == null) return Unauthorized(new { message = "Invalid token: no AccountId found." });
+
+            var safeRequest = request ?? new FollowPagingRequest();
+            if (safeRequest.PageSize > 50)
+            {
+                safeRequest.PageSize = 50;
+            }
+
+            var result = await _followService.GetSentPendingRequestsAsync(currentId.Value, safeRequest);
+            return Ok(result);
+        }
+
+        [Authorize]
         [HttpPost("requests/{requesterId}/accept")]
         public async Task<IActionResult> AcceptFollowRequest(Guid requesterId)
         {

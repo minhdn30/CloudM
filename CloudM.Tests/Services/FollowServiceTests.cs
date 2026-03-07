@@ -671,6 +671,72 @@ namespace CloudM.Tests.Services
 
         #endregion
 
+        #region GetSentPendingRequestsAsync Tests
+
+        [Fact]
+        public async Task GetSentPendingRequestsAsync_WhenCurrentAccountMissing_ThrowsForbiddenException()
+        {
+            // Arrange
+            var currentId = Guid.NewGuid();
+            var request = new FollowPagingRequest
+            {
+                Page = 1,
+                PageSize = 15
+            };
+
+            _mockAccountRepo.Setup(x => x.IsAccountIdExist(currentId)).ReturnsAsync(false);
+
+            // Act & Assert
+            await Assert.ThrowsAsync<ForbiddenException>(() =>
+                _followService.GetSentPendingRequestsAsync(currentId, request));
+        }
+
+        [Fact]
+        public async Task GetSentPendingRequestsAsync_WhenValid_ReturnsPagedResponse()
+        {
+            // Arrange
+            var currentId = Guid.NewGuid();
+            var request = new FollowPagingRequest
+            {
+                Keyword = "alex",
+                SortByCreatedASC = null,
+                Page = 1,
+                PageSize = 15
+            };
+            var items = new List<AccountWithFollowStatusModel>
+            {
+                new()
+                {
+                    AccountId = Guid.NewGuid(),
+                    Username = "alex.dev",
+                    FullName = "Alex Dev",
+                    AvatarUrl = "/avatars/alex.png",
+                    IsFollowing = false,
+                    IsFollowRequested = true,
+                    IsFollower = false
+                }
+            };
+
+            _mockAccountRepo.Setup(x => x.IsAccountIdExist(currentId)).ReturnsAsync(true);
+            _mockFollowRequestRepo
+                .Setup(x => x.GetPendingSentByRequesterAsync(currentId, "alex", null, 1, 15))
+                .ReturnsAsync((items, 1));
+
+            // Act
+            var result = await _followService.GetSentPendingRequestsAsync(currentId, request);
+
+            // Assert
+            result.Should().NotBeNull();
+            result.TotalItems.Should().Be(1);
+            result.Page.Should().Be(1);
+            result.PageSize.Should().Be(15);
+            result.Items.Should().ContainSingle();
+            result.Items.First().Username.Should().Be("alex.dev");
+            result.Items.First().IsFollowRequested.Should().BeTrue();
+        }
+
+        #endregion
+
         #region GetFollowersAsync Tests
 
         [Fact]

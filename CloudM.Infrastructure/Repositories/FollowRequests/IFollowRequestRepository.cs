@@ -1,4 +1,5 @@
 using CloudM.Domain.Entities;
+using CloudM.Infrastructure.Models;
 
 namespace CloudM.Infrastructure.Repositories.FollowRequests
 {
@@ -14,6 +15,12 @@ namespace CloudM.Infrastructure.Repositories.FollowRequests
             DateTime? cursorCreatedAt,
             Guid? cursorRequesterId,
             CancellationToken cancellationToken = default);
+        Task<(List<AccountWithFollowStatusModel> Items, int TotalItems)> GetPendingSentByRequesterAsync(
+            Guid requesterId,
+            string? keyword,
+            bool? sortByCreatedASC,
+            int page,
+            int pageSize);
         Task<int> GetPendingCountByTargetAsync(Guid targetId, CancellationToken cancellationToken = default);
         Task<List<ClaimedAutoAcceptFollowRequest>> ClaimAutoAcceptBatchAsync(int batchSize, CancellationToken cancellationToken = default);
     }

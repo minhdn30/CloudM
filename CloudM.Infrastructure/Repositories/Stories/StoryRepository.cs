@@ -79,8 +79,8 @@ namespace CloudM.Infrastructure.Repositories.Stories
                     UnseenCount = g.Count(x => !x.IsViewed),
                     ViewFrequencyScore = viewCountByAuthor
                         .Where(v => v.AuthorId == g.Key.AccountId)
-                        .Select(v => v.ViewCount)
-                        .FirstOrDefault()
+                        .Select(v => (int?)v.ViewCount)
+                        .Max() ?? 0
                 })
                 .OrderBy(x => x.AccountId == currentId ? 0 : 1)
                 .ThenBy(x => x.UnseenCount > 0 ? 0 : 1)
@@ -237,6 +237,50 @@ namespace CloudM.Infrastructure.Repositories.Stories
                 .Where(s => s.StoryId == storyId)
                 .Select(s => (Guid?)s.AccountId)
                 .FirstOrDefaultAsync();
+        }
+
+        public async Task<int?> ResolveArchivedPageByOwnerStoryIdAsync(
+            Guid ownerId,
+            Guid storyId,
+            DateTime nowUtc,
+            int pageSize)
+        {
+            if (ownerId == Guid.Empty || storyId == Guid.Empty)
+            {
+                return null;
+            }
+
+            if (pageSize <= 0)
+            {
+                pageSize = 20;
+            }
+
+            var baseQuery = _context.Stories
+                .AsNoTracking()
+                .Where(s =>
+                    s.AccountId == ownerId &&
+                    !s.IsDeleted &&
+                    s.ExpiresAt <= nowUtc);
+
+            var exists = await baseQuery.AnyAsync(s => s.StoryId == storyId);
+            if (!exists)
+            {
+                return null;
+            }
+
+            var orderedStoryIds = await baseQuery
+                .OrderByDescending(s => s.CreatedAt)
+                .ThenByDescending(s => s.StoryId)
+                .Select(s => s.StoryId)
+                .ToListAsync();
+
+            var index = orderedStoryIds.FindIndex(id => id == storyId);
+            if (index < 0)
+            {
+                return null;
+            }
+
+            return (index / pageSize) + 1;
         }
 
         public Task UpdateStoryAsync(Story story)

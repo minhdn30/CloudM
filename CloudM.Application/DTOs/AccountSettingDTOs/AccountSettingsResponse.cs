@@ -15,9 +15,11 @@ namespace CloudM.Application.DTOs.AccountSettingDTOs
         public PostPrivacyEnum DefaultPostPrivacy { get; set; }
         public AccountPrivacyEnum FollowerPrivacy { get; set; }
         public AccountPrivacyEnum FollowingPrivacy { get; set; }
+        public FollowPrivacyEnum FollowPrivacy { get; set; }
         public AccountPrivacyEnum StoryHighlightPrivacy { get; set; }
         public GroupChatInvitePermissionEnum GroupChatInvitePermission { get; set; }
         public OnlineStatusVisibilityEnum OnlineStatusVisibility { get; set; }
         public TagPermissionEnum TagPermission { get; set; }
+        public string Language { get; set; } = "en";
     }
 }

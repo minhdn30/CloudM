@@ -22,10 +22,13 @@ namespace CloudM.Domain.Entities
         
         public AccountPrivacyEnum FollowerPrivacy { get; set; } = AccountPrivacyEnum.Public;
         public AccountPrivacyEnum FollowingPrivacy { get; set; } = AccountPrivacyEnum.Public;
+        public FollowPrivacyEnum FollowPrivacy { get; set; } = FollowPrivacyEnum.Anyone;
         public AccountPrivacyEnum StoryHighlightPrivacy { get; set; } = AccountPrivacyEnum.Public;
         public GroupChatInvitePermissionEnum GroupChatInvitePermission { get; set; } = GroupChatInvitePermissionEnum.Anyone;
         public OnlineStatusVisibilityEnum OnlineStatusVisibility { get; set; } = OnlineStatusVisibilityEnum.ContactsOnly;
         public TagPermissionEnum TagPermission { get; set; } = TagPermissionEnum.Anyone;
+        [MaxLength(10)]
+        public string? Language { get; set; }
 
         public virtual Account Account { get; set; } = null!;
     }

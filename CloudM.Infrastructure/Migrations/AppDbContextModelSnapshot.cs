@@ -125,6 +125,9 @@ namespace CloudM.Infrastructure.Migrations
                     b.Property<int>("DefaultPostPrivacy")
                         .HasColumnType("integer");
 
+                    b.Property<int>("FollowPrivacy")
+                        .HasColumnType("integer");
+
                     b.Property<int>("FollowerPrivacy")
                         .HasColumnType("integer");
 
@@ -133,6 +136,10 @@ namespace CloudM.Infrastructure.Migrations
 
                     b.Property<int>("GroupChatInvitePermission")
                         .HasColumnType("integer");
+
+                    b.Property<string>("Language")
+                        .HasMaxLength(10)
+                        .HasColumnType("character varying(10)");
 
                     b.Property<int>("OnlineStatusVisibility")
                         .HasColumnType("integer");
@@ -433,6 +440,26 @@ namespace CloudM.Infrastructure.Migrations
                     b.HasIndex("FollowerId", "CreatedAt");
 
                     b.ToTable("Follows");
+                });
+
+            modelBuilder.Entity("CloudM.Domain.Entities.FollowRequest", b =>
+                {
+                    b.Property<Guid>("RequesterId")
+                        .HasColumnType("uuid");
+
+                    b.Property<Guid>("TargetId")
+                        .HasColumnType("uuid");
+
+                    b.Property<DateTime>("CreatedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.HasKey("RequesterId", "TargetId");
+
+                    b.HasIndex("RequesterId", "CreatedAt");
+
+                    b.HasIndex("TargetId", "CreatedAt");
+
+                    b.ToTable("FollowRequests");
                 });
 
             modelBuilder.Entity("CloudM.Domain.Entities.Message", b =>
@@ -1206,6 +1233,25 @@ namespace CloudM.Infrastructure.Migrations
                     b.Navigation("Follower");
                 });
 
+            modelBuilder.Entity("CloudM.Domain.Entities.FollowRequest", b =>
+                {
+                    b.HasOne("CloudM.Domain.Entities.Account", "Requester")
+                        .WithMany("FollowRequestsSent")
+                        .HasForeignKey("RequesterId")
+                        .OnDelete(DeleteBehavior.NoAction)
+                        .IsRequired();
+
+                    b.HasOne("CloudM.Domain.Entities.Account", "Target")
+                        .WithMany("FollowRequestsReceived")
+                        .HasForeignKey("TargetId")
+                        .OnDelete(DeleteBehavior.NoAction)
+                        .IsRequired();
+
+                    b.Navigation("Requester");
+
+                    b.Navigation("Target");
+                });
+
             modelBuilder.Entity("CloudM.Domain.Entities.Message", b =>
                 {
                     b.HasOne("CloudM.Domain.Entities.Account", "Account")
@@ -1499,6 +1545,10 @@ namespace CloudM.Infrastructure.Migrations
                     b.Navigation("CreatedConversations");
 
                     b.Navigation("ExternalLogins");
+
+                    b.Navigation("FollowRequestsReceived");
+
+                    b.Navigation("FollowRequestsSent");
 
                     b.Navigation("Followers");
 

@@ -444,7 +444,9 @@ namespace CloudM.Infrastructure.Repositories.Accounts
                 .Select(c => new
                 {
                     OtherAccountId = c.Members
-                        .Where(m => m.AccountId != currentId && candidateIds.Contains(m.AccountId))
+                        .Where(m => m.AccountId != currentId && candidateIds.Contains(m.AccountId) && !m.HasLeft)
+                        .OrderBy(m => m.JoinedAt)
+                        .ThenBy(m => m.AccountId)
                         .Select(m => m.AccountId)
                         .FirstOrDefault(),
                     LastMessageAt = c.Messages.Select(m => (DateTime?)m.SentAt).Max()
@@ -590,6 +592,8 @@ namespace CloudM.Infrastructure.Repositories.Accounts
                 {
                     OtherAccountId = c.Members
                         .Where(m => m.AccountId != currentId && candidateIds.Contains(m.AccountId) && !m.HasLeft)
+                        .OrderBy(m => m.JoinedAt)
+                        .ThenBy(m => m.AccountId)
                         .Select(m => m.AccountId)
                         .FirstOrDefault(),
                     LastMessageAt = c.Messages.Select(m => (DateTime?)m.SentAt).Max()
@@ -733,6 +737,8 @@ namespace CloudM.Infrastructure.Repositories.Accounts
                 {
                     OtherAccountId = c.Members
                         .Where(m => m.AccountId != currentId && candidateIds.Contains(m.AccountId) && !m.HasLeft)
+                        .OrderBy(m => m.JoinedAt)
+                        .ThenBy(m => m.AccountId)
                         .Select(m => m.AccountId)
                         .FirstOrDefault(),
                     LastMessageAt = c.Messages.Select(m => (DateTime?)m.SentAt).Max()
@@ -827,6 +833,8 @@ namespace CloudM.Infrastructure.Repositories.Accounts
                 {
                     OtherAccountId = c.Members
                         .Where(m => m.AccountId != currentId && !m.HasLeft)
+                        .OrderBy(m => m.JoinedAt)
+                        .ThenBy(m => m.AccountId)
                         .Select(m => m.AccountId)
                         .FirstOrDefault(),
                     LastMessageAt = c.Messages.Select(m => (DateTime?)m.SentAt).Max()
@@ -972,6 +980,8 @@ namespace CloudM.Infrastructure.Repositories.Accounts
                 {
                     OtherAccountId = c.Members
                         .Where(m => m.AccountId != currentId && !m.HasLeft)
+                        .OrderBy(m => m.JoinedAt)
+                        .ThenBy(m => m.AccountId)
                         .Select(m => m.AccountId)
                         .FirstOrDefault(),
                     LastMessageAt = c.Messages.Select(m => (DateTime?)m.SentAt).Max()

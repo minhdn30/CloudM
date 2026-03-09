@@ -79,8 +79,8 @@ namespace CloudM.Infrastructure.Repositories.Stories
                     UnseenCount = g.Count(x => !x.IsViewed),
                     ViewFrequencyScore = viewCountByAuthor
                         .Where(v => v.AuthorId == g.Key.AccountId)
-                        .Select(v => v.ViewCount)
-                        .FirstOrDefault()
+                        .Select(v => (int?)v.ViewCount)
+                        .Max() ?? 0
                 })
                 .OrderBy(x => x.AccountId == currentId ? 0 : 1)
                 .ThenBy(x => x.UnseenCount > 0 ? 0 : 1)

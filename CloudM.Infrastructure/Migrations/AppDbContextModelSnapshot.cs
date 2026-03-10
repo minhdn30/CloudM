@@ -261,8 +261,6 @@ namespace CloudM.Infrastructure.Migrations
                     NpgsqlIndexBuilderExtensions.HasMethod(b.HasIndex("ConversationName"), "GIN");
                     NpgsqlIndexBuilderExtensions.HasOperators(b.HasIndex("ConversationName"), new[] { "gin_trgm_ops" });
 
-                    b.HasIndex("CreatedAt");
-
                     b.HasIndex("CreatedBy");
 
                     b.HasIndex("Owner");

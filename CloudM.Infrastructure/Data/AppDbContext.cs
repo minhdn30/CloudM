@@ -671,10 +671,6 @@ namespace CloudM.Infrastructure.Data
                     "CK_Conversations_GroupOwner",
                     "(\"IsGroup\" = FALSE AND \"Owner\" IS NULL) OR (\"IsGroup\" = TRUE AND \"Owner\" IS NOT NULL)"));
 
-            // Index: sort / filter conversations
-            modelBuilder.Entity<Conversation>()
-                .HasIndex(c => c.CreatedAt);
-
             modelBuilder.Entity<Conversation>()
                 .HasIndex(c => c.CreatedBy);
 

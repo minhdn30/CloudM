@@ -56,12 +56,12 @@ namespace CloudM.Infrastructure.Repositories.Accounts
         public async Task<bool> IsUsernameExist (string username)
         {
             var normalizedUsername = (username ?? string.Empty).Trim().ToLower();
-            return await _context.Accounts.AnyAsync(a => a.Username.ToLower() == normalizedUsername);
+            return await _context.Accounts.AnyAsync(a => a.Username == normalizedUsername);
         }
         public async Task<bool> IsEmailExist(string email)
         {
             var normalizedEmail = (email ?? string.Empty).Trim().ToLower();
-            return await _context.Accounts.AnyAsync(a => a.Email.ToLower() == normalizedEmail);
+            return await _context.Accounts.AnyAsync(a => a.Email == normalizedEmail);
         }
         public async Task<bool> IsAccountIdExist(Guid accountId)
         {
@@ -83,10 +83,11 @@ namespace CloudM.Infrastructure.Repositories.Accounts
         }
         public async Task<Account?> GetAccountByEmail(string email)
         {
+            var normalizedEmail = (email ?? string.Empty).Trim().ToLower();
             return await _context.Accounts
                 .Include(a => a.Role)
                 .Include(a => a.Settings)
-                .FirstOrDefaultAsync(a => a.Email.ToLower() == email.ToLower());
+                .FirstOrDefaultAsync(a => a.Email == normalizedEmail);
         }
         public Task UpdateAccount(Account account)
         {
@@ -95,10 +96,11 @@ namespace CloudM.Infrastructure.Repositories.Accounts
         }
         public async Task<Account?> GetAccountByUsername(string username)
         {
+            var normalizedUsername = (username ?? string.Empty).Trim().ToLower();
             return await _context.Accounts
                 .Include(a => a.Role)
                 .Include(a => a.Settings)
-                .FirstOrDefaultAsync(a => a.Username.ToLower() == username.ToLower());
+                .FirstOrDefaultAsync(a => a.Username == normalizedUsername);
         }
         public async Task<Account?> GetByRefreshToken(string refreshToken)
         {
@@ -298,8 +300,9 @@ namespace CloudM.Infrastructure.Repositories.Accounts
 
         public async Task<ProfileInfoModel?> GetProfileInfoByUsernameAsync(string username, Guid? currentId)
         {
+            var normalizedUsername = (username ?? string.Empty).Trim().ToLower();
             var data = await GetSocialAccountsNoTrackingQuery()
-                .Where(a => a.Username.ToLower() == username.ToLower() && a.Status == AccountStatusEnum.Active)
+                .Where(a => a.Username == normalizedUsername && a.Status == AccountStatusEnum.Active)
                 .Select(a => new
                 {
                     a.AccountId,
@@ -826,7 +829,7 @@ namespace CloudM.Infrastructure.Repositories.Accounts
 
             return await GetSocialAccountsQuery()
                 .Include(a => a.Settings)
-                .Where(a => normalizedUsernames.Contains(a.Username.ToLower()))
+                .Where(a => normalizedUsernames.Contains(a.Username))
                 .ToListAsync();
         }
 

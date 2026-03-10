@@ -505,6 +505,171 @@ namespace CloudM.Tests.Services
 
         #endregion
 
+        #region Password Management Tests
+
+        [Fact]
+        public async Task GetPasswordStatusAsync_ReturnsPasswordStatusAndExternalLogins()
+        {
+            // Arrange
+            var accountId = Guid.NewGuid();
+            var account = TestDataFactory.CreateAccount(accountId: accountId);
+            account.PasswordHash = BCrypt.Net.BCrypt.HashPassword("Password123");
+            var externalLogins = new List<ExternalLogin>
+            {
+                new()
+                {
+                    AccountId = accountId,
+                    Provider = ExternalLoginProviderEnum.Google,
+                    ProviderUserId = "google-user-1",
+                    CreatedAt = DateTime.UtcNow.AddDays(-7),
+                    LastLoginAt = DateTime.UtcNow.AddDays(-1),
+                }
+            };
+
+            _accountRepositoryMock.Setup(x => x.GetAccountById(accountId)).ReturnsAsync(account);
+            _externalLoginRepositoryMock.Setup(x => x.GetByAccountIdAsync(accountId)).ReturnsAsync(externalLogins);
+
+            // Act
+            var result = await _authService.GetPasswordStatusAsync(accountId);
+
+            // Assert
+            result.HasPassword.Should().BeTrue();
+            result.ExternalLogins.Should().HaveCount(1);
+            result.ExternalLogins[0].Provider.Should().Be("Google");
+        }
+
+        [Fact]
+        public async Task ChangePasswordAsync_WithCurrentPassword_UpdatesPassword()
+        {
+            // Arrange
+            var accountId = Guid.NewGuid();
+            var account = TestDataFactory.CreateAccount(accountId: accountId);
+            account.PasswordHash = BCrypt.Net.BCrypt.HashPassword("OldPassword123");
+            account.RefreshToken = "old-refresh-token";
+            account.RefreshTokenExpiryTime = DateTime.UtcNow.AddDays(1);
+            account.Settings = new AccountSettings
+            {
+                AccountId = accountId,
+                DefaultPostPrivacy = PostPrivacyEnum.Public
+            };
+            const string newAccessToken = "new-access-token";
+
+            _accountRepositoryMock.Setup(x => x.GetAccountById(accountId)).ReturnsAsync(account);
+            _jwtServiceMock.Setup(x => x.GenerateToken(account)).Returns(newAccessToken);
+            _unitOfWorkMock.Setup(x => x.CommitAsync()).Returns(Task.CompletedTask);
+
+            // Act
+            var result = await _authService.ChangePasswordAsync(
+                accountId,
+                "OldPassword123",
+                "NewPassword123",
+                "NewPassword123");
+
+            // Assert
+            BCrypt.Net.BCrypt.Verify("NewPassword123", account.PasswordHash).Should().BeTrue();
+            BCrypt.Net.BCrypt.Verify("OldPassword123", account.PasswordHash).Should().BeFalse();
+            result.AccessToken.Should().Be(newAccessToken);
+            result.RefreshToken.Should().NotBeNullOrWhiteSpace();
+            result.RefreshToken.Should().NotBe("old-refresh-token");
+            account.RefreshToken.Should().Be(result.RefreshToken);
+            account.RefreshTokenExpiryTime.Should().NotBeNull();
+            _accountRepositoryMock.Verify(x => x.UpdateAccount(account), Times.Once);
+            _unitOfWorkMock.Verify(x => x.CommitAsync(), Times.Once);
+        }
+
+        [Fact]
+        public async Task ChangePasswordAsync_CurrentPasswordMissing_ThrowsBadRequestException()
+        {
+            // Arrange
+            var accountId = Guid.NewGuid();
+            var account = TestDataFactory.CreateAccount(accountId: accountId);
+            account.PasswordHash = BCrypt.Net.BCrypt.HashPassword("OldPassword123");
+
+            _accountRepositoryMock.Setup(x => x.GetAccountById(accountId)).ReturnsAsync(account);
+
+            // Act
+            var act = () => _authService.ChangePasswordAsync(
+                accountId,
+                string.Empty,
+                "NewPassword123",
+                "NewPassword123");
+
+            // Assert
+            await act.Should().ThrowAsync<BadRequestException>()
+                .WithMessage("Current password is required.");
+        }
+
+        [Fact]
+        public async Task ChangePasswordAsync_CurrentPasswordIncorrect_ThrowsBadRequestException()
+        {
+            // Arrange
+            var accountId = Guid.NewGuid();
+            var account = TestDataFactory.CreateAccount(accountId: accountId);
+            account.PasswordHash = BCrypt.Net.BCrypt.HashPassword("OldPassword123");
+
+            _accountRepositoryMock.Setup(x => x.GetAccountById(accountId)).ReturnsAsync(account);
+
+            // Act
+            var act = () => _authService.ChangePasswordAsync(
+                accountId,
+                "WrongPassword123",
+                "NewPassword123",
+                "NewPassword123");
+
+            // Assert
+            await act.Should().ThrowAsync<BadRequestException>()
+                .WithMessage("Current password is incorrect.");
+        }
+
+        [Fact]
+        public async Task ChangePasswordAsync_ConfirmPasswordMismatch_ThrowsBadRequestException()
+        {
+            // Act
+            var act = () => _authService.ChangePasswordAsync(
+                Guid.NewGuid(),
+                string.Empty,
+                "NewPassword123",
+                "AnotherPassword123");
+
+            // Assert
+            await act.Should().ThrowAsync<BadRequestException>()
+                .WithMessage("Password and Confirm Password do not match.");
+        }
+
+        [Fact]
+        public async Task ChangePasswordAsync_WithoutExistingPassword_AllowsSettingPassword()
+        {
+            // Arrange
+            var accountId = Guid.NewGuid();
+            var account = TestDataFactory.CreateAccount(accountId: accountId);
+            account.PasswordHash = null;
+            account.Settings = new AccountSettings
+            {
+                AccountId = accountId,
+                DefaultPostPrivacy = PostPrivacyEnum.Public
+            };
+
+            _accountRepositoryMock.Setup(x => x.GetAccountById(accountId)).ReturnsAsync(account);
+            _jwtServiceMock.Setup(x => x.GenerateToken(account)).Returns("set-password-access-token");
+            _unitOfWorkMock.Setup(x => x.CommitAsync()).Returns(Task.CompletedTask);
+
+            // Act
+            var result = await _authService.ChangePasswordAsync(
+                accountId,
+                string.Empty,
+                "NewPassword123",
+                "NewPassword123");
+
+            // Assert
+            BCrypt.Net.BCrypt.Verify("NewPassword123", account.PasswordHash).Should().BeTrue();
+            result.AccessToken.Should().Be("set-password-access-token");
+            result.RefreshToken.Should().NotBeNullOrWhiteSpace();
+            _accountRepositoryMock.Verify(x => x.UpdateAccount(account), Times.Once);
+            _unitOfWorkMock.Verify(x => x.CommitAsync(), Times.Once);
+        }
+
+        #endregion
+
         #region LogoutAsync Tests
 
         [Fact]

@@ -22,6 +22,8 @@ namespace CloudM.Application.Services.AuthServices
         Task<LoginResponse> LoginWithExternalAsync(ExternalLoginProviderEnum provider, string credential);
         Task<LoginResponse> LoginWithGoogleAsync(string idToken);
         Task<IReadOnlyList<ExternalLoginSummaryResponse>> GetExternalLoginsAsync(Guid accountId);
+        Task<PasswordStatusResponse> GetPasswordStatusAsync(Guid accountId);
+        Task<LoginResponse> ChangePasswordAsync(Guid accountId, string currentPassword, string newPassword, string confirmPassword);
         Task UnlinkExternalLoginAsync(Guid accountId, ExternalLoginProviderEnum provider);
         Task SetPasswordAsync(Guid accountId, string newPassword, string confirmPassword);
         Task<LoginResponse?> RefreshTokenAsync(string refreshToken);

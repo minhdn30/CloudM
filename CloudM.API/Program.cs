@@ -111,6 +111,8 @@ namespace CloudM.API
                 }
             }
 
+            var redisMultiplexer = TryCreateRedisConnectionMultiplexer(builder.Configuration);
+
             builder.Services.AddDbContext<AppDbContext>(options =>
                 options.UseNpgsql(connectionString, npgsqlOptions =>
                 {
@@ -118,6 +120,7 @@ namespace CloudM.API
                     npgsqlOptions.CommandTimeout(30);
                 })
             );
+            builder.Services.AddMemoryCache();
 
             // Repositories
             builder.Services.AddScoped<IAccountRepository, AccountRepository>();
@@ -167,16 +170,18 @@ namespace CloudM.API
                 builder.Configuration.GetSection("FollowAutoAccept"));
             builder.Services.Configure<FeedRankingOptions>(
                 builder.Configuration.GetSection("FeedRanking"));
-            builder.Services.AddSingleton<IConnectionMultiplexer>(_ =>
+
+            if (redisMultiplexer != null)
             {
-                var redisConnectionString = BuildRedisConnectionString(builder.Configuration);
-                return ConnectionMultiplexer.Connect(redisConnectionString);
-            });
+                builder.Services.AddSingleton<IConnectionMultiplexer>(redisMultiplexer);
+            }
+            builder.Services.AddSingleton<MemoryLoginRateLimitService>();
+            builder.Services.AddSingleton<MemoryPresenceSnapshotRateLimiter>();
+            builder.Services.AddSingleton<MemoryPresenceHiddenBroadcastTracker>();
 
             builder.Services.AddScoped<IAuthService, AuthService>();
             builder.Services.AddScoped<IExternalIdentityProvider, GoogleExternalIdentityProvider>();
             builder.Services.AddScoped<IPasswordResetService, PasswordResetService>();
-            builder.Services.AddScoped<ILoginRateLimitService, RedisLoginRateLimitService>();
             builder.Services.AddScoped<IAccountService, AccountService>();
             builder.Services.AddScoped<IAccountSearchHistoryService, AccountSearchHistoryService>();
             builder.Services.AddScoped<IBlockService, BlockService>();
@@ -187,7 +192,6 @@ namespace CloudM.API
 
             builder.Services.AddTransient<IEmailService, EmailService>();
             builder.Services.AddScoped<IEmailVerificationService, EmailVerificationService>();
-            builder.Services.AddScoped<IEmailVerificationRateLimitService, RedisEmailVerificationRateLimitService>();
             builder.Services.AddScoped<IJwtService, JwtService>();
             builder.Services.AddScoped<IFollowService, FollowService>();
             builder.Services.AddScoped<IFollowAutoAcceptService, FollowAutoAcceptService>();
@@ -214,11 +218,24 @@ namespace CloudM.API
 
             // Realtime Services
             builder.Services.AddScoped<IRealtimeService, RealtimeService>();
-            builder.Services.AddScoped<IOnlinePresenceService, OnlinePresenceService>();
             builder.Services.AddHostedService<EmailVerificationCleanupHostedService>();
             builder.Services.AddHostedService<OnlinePresenceCleanupHostedService>();
             builder.Services.AddHostedService<NotificationOutboxWorkerHostedService>();
             builder.Services.AddHostedService<FollowAutoAcceptWorkerHostedService>();
+
+            if (redisMultiplexer != null)
+            {
+                builder.Services.AddScoped<ILoginRateLimitService, RedisLoginRateLimitService>();
+                builder.Services.AddScoped<IEmailVerificationRateLimitService, RedisEmailVerificationRateLimitService>();
+                builder.Services.AddScoped<IOnlinePresenceService, OnlinePresenceService>();
+            }
+            else
+            {
+                builder.Services.AddScoped<ILoginRateLimitService>(
+                    provider => provider.GetRequiredService<MemoryLoginRateLimitService>());
+                builder.Services.AddScoped<IEmailVerificationRateLimitService, UnavailableEmailVerificationRateLimitService>();
+                builder.Services.AddScoped<IOnlinePresenceService, NoOpOnlinePresenceService>();
+            }
 
             // Helpers
             builder.Services.AddScoped<IStoryRingStateHelper, StoryRingStateHelper>();
@@ -422,13 +439,48 @@ namespace CloudM.API
             return csb.ToString();
         }
 
-        private static string BuildRedisConnectionString(IConfiguration configuration)
+        private static IConnectionMultiplexer? TryCreateRedisConnectionMultiplexer(IConfiguration configuration)
+        {
+            var redisConnectionString = BuildRedisConnectionString(configuration);
+            if (string.IsNullOrWhiteSpace(redisConnectionString))
+            {
+                Console.WriteLine("[Redis] Disabled: connection string is not configured. Running in degraded mode.");
+                return null;
+            }
+
+            try
+            {
+                var multiplexer = ConnectionMultiplexer.Connect(redisConnectionString);
+                if (!multiplexer.IsConnected)
+                {
+                    multiplexer.Dispose();
+                    Console.WriteLine("[Redis] Disabled: no active Redis connection. Running in degraded mode.");
+                    return null;
+                }
+
+                Console.WriteLine("[Redis] Enabled.");
+                return multiplexer;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[Redis] Disabled: {ex.GetType().Name}. Running in degraded mode.");
+                return null;
+            }
+        }
+
+        private static string? BuildRedisConnectionString(IConfiguration configuration)
         {
             var rawConnectionString = FirstNonEmpty(
                 configuration.GetConnectionString("Redis"),
                 configuration["Redis:ConnectionString"]);
 
-            return RequireConfiguredValue(rawConnectionString, "ConnectionStrings:Redis");
+            var sanitized = rawConnectionString?.Trim().Trim('"', '\'');
+            if (string.IsNullOrWhiteSpace(sanitized) || IsPlaceholderValue(sanitized))
+            {
+                return null;
+            }
+
+            return sanitized;
         }
 
         private static NpgsqlConnectionStringBuilder BuildFromDatabaseUrl(string databaseUrl)

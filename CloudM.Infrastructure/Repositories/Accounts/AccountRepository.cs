@@ -968,27 +968,7 @@ namespace CloudM.Infrastructure.Repositories.Accounts
                 .Distinct()
                 .ToList();
 
-            var directChatRows = await _context.Conversations
-                .AsNoTracking()
-                .Where(c => !c.IsDeleted && !c.IsGroup)
-                .Where(c => c.Members.Any(m => m.AccountId == currentId && !m.HasLeft))
-                .Where(c => c.Members.Any(m => candidateIds.Contains(m.AccountId) && !m.HasLeft))
-                .Select(c => new
-                {
-                    OtherAccountId = c.Members
-                        .Where(m => m.AccountId != currentId && candidateIds.Contains(m.AccountId) && !m.HasLeft)
-                        .OrderBy(m => m.JoinedAt)
-                        .ThenBy(m => m.AccountId)
-                        .Select(m => m.AccountId)
-                        .FirstOrDefault(),
-                    LastMessageAt = c.Messages.Select(m => (DateTime?)m.SentAt).Max()
-                })
-                .Where(x => x.OtherAccountId != Guid.Empty)
-                .ToListAsync();
-
-            var directChatMap = directChatRows
-                .GroupBy(x => x.OtherAccountId)
-                .ToDictionary(g => g.Key, g => g.Max(x => x.LastMessageAt));
+            var directChatMap = await GetDirectConversationLastContactMapAsync(currentId, candidateIds);
 
             var historyRows = await _context.AccountSearchHistories
                 .AsNoTracking()
@@ -1024,6 +1004,10 @@ namespace CloudM.Infrastructure.Repositories.Accounts
                             Username = candidate.Username,
                             FullName = candidate.FullName,
                             AvatarUrl = candidate.AvatarUrl,
+                            IsFollowing = candidate.IsFollowing,
+                            IsFollower = candidate.IsFollower,
+                            HasDirectConversation = directChatMap.ContainsKey(candidate.AccountId),
+                            LastContactedAt = lastContactedAt,
                             LastSearchedAt = lastSearchedAt
                         },
                         TotalScore = totalScore,
@@ -1254,9 +1238,16 @@ namespace CloudM.Infrastructure.Repositories.Accounts
                     prioritizeDiscovery,
                     jitterBucketCount);
 
-                var inMemoryItems = orderedCandidates
+                var pagedCandidates = orderedCandidates
                     .Skip((normalizedPage - 1) * normalizedPageSize)
                     .Take(normalizedPageSize)
+                    .ToList();
+
+                var lastContactedMap = await GetDirectConversationLastContactMapAsync(
+                    currentId,
+                    pagedCandidates.Select(x => x.AccountId).ToList());
+
+                var inMemoryItems = pagedCandidates
                     .Select(x => new FollowSuggestionCandidateModel
                     {
                         AccountId = x.AccountId,
@@ -1265,6 +1256,8 @@ namespace CloudM.Infrastructure.Repositories.Accounts
                         AvatarUrl = x.AvatarUrl,
                         IsContact = x.IsContact,
                         IsFollower = x.IsFollower,
+                        HasDirectConversation = lastContactedMap.ContainsKey(x.AccountId),
+                        LastContactedAt = lastContactedMap.GetValueOrDefault(x.AccountId),
                         MutualFollowCount = x.MutualConnectionCount
                     })
                     .ToList();
@@ -1312,6 +1305,16 @@ namespace CloudM.Infrastructure.Repositories.Accounts
                     MutualFollowCount = x.MutualConnectionCount
                 })
                 .ToListAsync();
+
+            var pageLastContactedMap = await GetDirectConversationLastContactMapAsync(
+                currentId,
+                items.Select(x => x.AccountId).ToList());
+
+            foreach (var item in items)
+            {
+                item.HasDirectConversation = pageLastContactedMap.ContainsKey(item.AccountId);
+                item.LastContactedAt = pageLastContactedMap.GetValueOrDefault(item.AccountId);
+            }
 
             return (items, totalItems);
         }
@@ -1900,6 +1903,38 @@ namespace CloudM.Infrastructure.Repositories.Accounts
             }
 
             return 150d;
+        }
+
+        private async Task<Dictionary<Guid, DateTime?>> GetDirectConversationLastContactMapAsync(
+            Guid currentId,
+            List<Guid> candidateIds)
+        {
+            if (candidateIds.Count == 0)
+            {
+                return new Dictionary<Guid, DateTime?>();
+            }
+
+            var directChatRows = await _context.Conversations
+                .AsNoTracking()
+                .Where(c => !c.IsDeleted && !c.IsGroup)
+                .Where(c => c.Members.Any(m => m.AccountId == currentId && !m.HasLeft))
+                .Where(c => c.Members.Any(m => candidateIds.Contains(m.AccountId) && !m.HasLeft))
+                .Select(c => new
+                {
+                    OtherAccountId = c.Members
+                        .Where(m => m.AccountId != currentId && candidateIds.Contains(m.AccountId) && !m.HasLeft)
+                        .OrderBy(m => m.JoinedAt)
+                        .ThenBy(m => m.AccountId)
+                        .Select(m => m.AccountId)
+                        .FirstOrDefault(),
+                    LastMessageAt = c.Messages.Select(m => (DateTime?)m.SentAt).Max()
+                })
+                .Where(x => x.OtherAccountId != Guid.Empty)
+                .ToListAsync();
+
+            return directChatRows
+                .GroupBy(x => x.OtherAccountId)
+                .ToDictionary(g => g.Key, g => g.Max(x => x.LastMessageAt));
         }
 
         private static double ComputeSidebarHistoryScore(DateTime? lastSearchedAt, DateTime nowUtc)

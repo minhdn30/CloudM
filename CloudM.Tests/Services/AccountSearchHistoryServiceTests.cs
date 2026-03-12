@@ -37,6 +37,10 @@ namespace CloudM.Tests.Services
                     Username = "minh",
                     FullName = "Minh Tran",
                     AvatarUrl = "avatar.jpg",
+                    IsFollowing = false,
+                    IsFollower = true,
+                    HasDirectConversation = true,
+                    LastContactedAt = searchedAt.AddDays(-3),
                     LastSearchedAt = searchedAt
                 }
             };
@@ -52,6 +56,10 @@ namespace CloudM.Tests.Services
             result[0].Username.Should().Be("minh");
             result[0].FullName.Should().Be("Minh Tran");
             result[0].AvatarUrl.Should().Be("avatar.jpg");
+            result[0].IsFollowing.Should().BeFalse();
+            result[0].IsFollower.Should().BeTrue();
+            result[0].HasDirectConversation.Should().BeTrue();
+            result[0].LastContactedAt.Should().Be(searchedAt.AddDays(-3));
             result[0].LastSearchedAt.Should().Be(searchedAt);
         }
 

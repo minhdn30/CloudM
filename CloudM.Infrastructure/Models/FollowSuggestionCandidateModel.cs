@@ -8,6 +8,8 @@ namespace CloudM.Infrastructure.Models
         public string? AvatarUrl { get; set; }
         public bool IsContact { get; set; }
         public bool IsFollower { get; set; }
+        public bool HasDirectConversation { get; set; }
+        public DateTime? LastContactedAt { get; set; }
         public int MutualFollowCount { get; set; }
     }
 }

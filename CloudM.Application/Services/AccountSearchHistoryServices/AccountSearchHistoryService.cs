@@ -64,6 +64,10 @@ namespace CloudM.Application.Services.AccountSearchHistoryServices
                 Username = item.Username,
                 FullName = item.FullName,
                 AvatarUrl = item.AvatarUrl,
+                IsFollowing = item.IsFollowing,
+                IsFollower = item.IsFollower,
+                HasDirectConversation = item.HasDirectConversation,
+                LastContactedAt = item.LastContactedAt,
                 LastSearchedAt = item.LastSearchedAt
             };
         }

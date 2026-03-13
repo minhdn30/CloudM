@@ -78,6 +78,7 @@ using System.Linq;
 using System.Text;
 using System.Text.Json;
 using StackExchange.Redis;
+using Resend;
 
 
 namespace CloudM.API
@@ -170,6 +171,10 @@ namespace CloudM.API
                 builder.Configuration.GetSection("FollowAutoAccept"));
             builder.Services.Configure<FeedRankingOptions>(
                 builder.Configuration.GetSection("FeedRanking"));
+            builder.Services.Configure<ResendClientOptions>(options =>
+            {
+                options.ApiToken = builder.Configuration["Email:ResendApiKey"] ?? string.Empty;
+            });
 
             if (redisMultiplexer != null)
             {
@@ -190,7 +195,11 @@ namespace CloudM.API
             builder.Services.AddHostedService<CloudinaryDeleteWorkerHostedService>();
             builder.Services.AddSingleton<ICloudinaryService, CloudinaryService>();
 
-            builder.Services.AddTransient<IEmailService, EmailService>();
+            builder.Services.AddHttpClient<ResendClient>();
+            builder.Services.AddTransient<IResend, ResendClient>();
+            builder.Services.AddTransient<EmailService>();
+            builder.Services.AddTransient<ResendEmailService>();
+            builder.Services.AddTransient<IEmailService>(EmailProviderResolver.Resolve);
             builder.Services.AddScoped<IEmailVerificationService, EmailVerificationService>();
             builder.Services.AddScoped<IJwtService, JwtService>();
             builder.Services.AddScoped<IFollowService, FollowService>();

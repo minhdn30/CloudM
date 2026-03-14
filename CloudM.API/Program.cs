@@ -16,6 +16,9 @@ using CloudM.Application.Mapping;
 using CloudM.Application.Services.AccountServices;
 using CloudM.Application.Services.AccountSearchHistoryServices;
 using CloudM.Application.Services.AccountSettingServices;
+using CloudM.Application.Services.AdminAuditLogServices;
+using CloudM.Application.Services.AdminAuthServices;
+using CloudM.Application.Services.AdminPortalServices;
 using CloudM.Application.Services.AuthServices;
 using CloudM.Application.Services.BlockServices;
 using CloudM.Infrastructure.Services.Cloudinary;
@@ -49,6 +52,9 @@ using CloudM.Infrastructure.Repositories.Accounts;
 using CloudM.Infrastructure.Repositories.AccountBlocks;
 using CloudM.Infrastructure.Repositories.AccountSearchHistories;
 using CloudM.Infrastructure.Repositories.AccountSettingRepos;
+using CloudM.Infrastructure.Repositories.AdminAuditLogs;
+using CloudM.Infrastructure.Repositories.AdminAuths;
+using CloudM.Infrastructure.Repositories.AdminPortals;
 using CloudM.Infrastructure.Repositories.CommentReacts;
 using CloudM.Infrastructure.Repositories.Comments;
 using CloudM.Infrastructure.Repositories.ConversationMembers;
@@ -127,7 +133,7 @@ namespace CloudM.API
             builder.Services.AddScoped<IAccountRepository, AccountRepository>();
             builder.Services.AddScoped<IAccountBlockRepository, AccountBlockRepository>();
             builder.Services.AddScoped<IAccountSearchHistoryRepository, AccountSearchHistoryRepository>();
-            builder.Services.AddScoped<IAccountSettingRepository, AccountSettingRepository>();
+            builder.Services.AddScoped<IAccountSettingRepository, AccountSettingRepository>();           
             builder.Services.AddScoped<IEmailVerificationRepository, EmailVerificationRepository>();
             builder.Services.AddScoped<IExternalLoginRepository, ExternalLoginRepository>();
             builder.Services.AddScoped<IFollowRepository, FollowRepository>();
@@ -154,6 +160,11 @@ namespace CloudM.API
             builder.Services.AddScoped<INotificationOutboxRepository, NotificationOutboxRepository>();
             builder.Services.AddScoped<IUnitOfWork, UnitOfWork>();
 
+            //admin
+            builder.Services.AddScoped<IAdminAuditLogRepository, AdminAuditLogRepository>();
+            builder.Services.AddScoped<IAdminAuthRepository, AdminAuthRepository>();
+            builder.Services.AddScoped<IAdminPortalRepository, AdminPortalRepository>();
+            
             // Services
             builder.Services.Configure<LoginSecurityOptions>(
                 builder.Configuration.GetSection("LoginSecurity"));
@@ -185,6 +196,7 @@ namespace CloudM.API
             builder.Services.AddSingleton<MemoryPresenceHiddenBroadcastTracker>();
 
             builder.Services.AddScoped<IAuthService, AuthService>();
+            
             builder.Services.AddScoped<IExternalIdentityProvider, GoogleExternalIdentityProvider>();
             builder.Services.AddScoped<IPasswordResetService, PasswordResetService>();
             builder.Services.AddScoped<IAccountService, AccountService>();
@@ -194,6 +206,11 @@ namespace CloudM.API
             builder.Services.AddSingleton<ICloudinaryDeleteBackgroundQueue, CloudinaryDeleteBackgroundQueue>();
             builder.Services.AddHostedService<CloudinaryDeleteWorkerHostedService>();
             builder.Services.AddSingleton<ICloudinaryService, CloudinaryService>();
+
+            //admin
+            builder.Services.AddScoped<IAdminAuditLogService, AdminAuditLogService>();
+            builder.Services.AddScoped<IAdminAuthService, AdminAuthService>();
+            builder.Services.AddScoped<IAdminPortalService, AdminPortalService>();
 
             builder.Services.AddHttpClient<ResendClient>();
             builder.Services.AddTransient<IResend, ResendClient>();
@@ -305,6 +322,15 @@ namespace CloudM.API
                     }
                 };
 
+            });
+
+            builder.Services.AddAuthorization(options =>
+            {
+                options.AddPolicy("AdminOnly", policy =>
+                {
+                    policy.RequireAuthenticatedUser();
+                    policy.RequireRole("Admin");
+                });
             });
 
 

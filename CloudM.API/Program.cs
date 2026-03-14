@@ -20,6 +20,7 @@ using CloudM.Application.Services.AdminAccountLookupServices;
 using CloudM.Application.Services.AdminAccountStatusServices;
 using CloudM.Application.Services.AdminAuditLogServices;
 using CloudM.Application.Services.AdminAuthServices;
+using CloudM.Application.Services.AdminModerationServices;
 using CloudM.Application.Services.AdminPortalServices;
 using CloudM.Application.Services.AuthServices;
 using CloudM.Application.Services.BlockServices;
@@ -58,6 +59,7 @@ using CloudM.Infrastructure.Repositories.AdminAccountLookups;
 using CloudM.Infrastructure.Repositories.AdminAccountStatuses;
 using CloudM.Infrastructure.Repositories.AdminAuditLogs;
 using CloudM.Infrastructure.Repositories.AdminAuths;
+using CloudM.Infrastructure.Repositories.AdminModerations;
 using CloudM.Infrastructure.Repositories.AdminPortals;
 using CloudM.Infrastructure.Repositories.CommentReacts;
 using CloudM.Infrastructure.Repositories.Comments;
@@ -169,6 +171,7 @@ namespace CloudM.API
             builder.Services.AddScoped<IAdminAccountStatusRepository, AdminAccountStatusRepository>();
             builder.Services.AddScoped<IAdminAuditLogRepository, AdminAuditLogRepository>();
             builder.Services.AddScoped<IAdminAuthRepository, AdminAuthRepository>();
+            builder.Services.AddScoped<IAdminModerationRepository, AdminModerationRepository>();
             builder.Services.AddScoped<IAdminPortalRepository, AdminPortalRepository>();
             
             // Services
@@ -218,6 +221,7 @@ namespace CloudM.API
             builder.Services.AddScoped<IAdminAccountStatusService, AdminAccountStatusService>();
             builder.Services.AddScoped<IAdminAuditLogService, AdminAuditLogService>();
             builder.Services.AddScoped<IAdminAuthService, AdminAuthService>();
+            builder.Services.AddScoped<IAdminModerationService, AdminModerationService>();
             builder.Services.AddScoped<IAdminPortalService, AdminPortalService>();
 
             builder.Services.AddHttpClient<ResendClient>();

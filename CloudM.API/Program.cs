@@ -22,6 +22,7 @@ using CloudM.Application.Services.AdminAuditLogServices;
 using CloudM.Application.Services.AdminAuthServices;
 using CloudM.Application.Services.AdminModerationServices;
 using CloudM.Application.Services.AdminPortalServices;
+using CloudM.Application.Services.AdminReportServices;
 using CloudM.Application.Services.AuthServices;
 using CloudM.Application.Services.BlockServices;
 using CloudM.Infrastructure.Services.Cloudinary;
@@ -61,6 +62,7 @@ using CloudM.Infrastructure.Repositories.AdminAuditLogs;
 using CloudM.Infrastructure.Repositories.AdminAuths;
 using CloudM.Infrastructure.Repositories.AdminModerations;
 using CloudM.Infrastructure.Repositories.AdminPortals;
+using CloudM.Infrastructure.Repositories.AdminReports;
 using CloudM.Infrastructure.Repositories.CommentReacts;
 using CloudM.Infrastructure.Repositories.Comments;
 using CloudM.Infrastructure.Repositories.ConversationMembers;
@@ -173,6 +175,7 @@ namespace CloudM.API
             builder.Services.AddScoped<IAdminAuthRepository, AdminAuthRepository>();
             builder.Services.AddScoped<IAdminModerationRepository, AdminModerationRepository>();
             builder.Services.AddScoped<IAdminPortalRepository, AdminPortalRepository>();
+            builder.Services.AddScoped<IAdminReportRepository, AdminReportRepository>();
             
             // Services
             builder.Services.Configure<LoginSecurityOptions>(
@@ -223,6 +226,7 @@ namespace CloudM.API
             builder.Services.AddScoped<IAdminAuthService, AdminAuthService>();
             builder.Services.AddScoped<IAdminModerationService, AdminModerationService>();
             builder.Services.AddScoped<IAdminPortalService, AdminPortalService>();
+            builder.Services.AddScoped<IAdminReportService, AdminReportService>();
 
             builder.Services.AddHttpClient<ResendClient>();
             builder.Services.AddTransient<IResend, ResendClient>();

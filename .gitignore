@@ -23,6 +23,7 @@ _tmpbuild2/
 # Sensitive files
 .env
 .env.*
+!.env.production.example
 *.pem
 *.key
 *.pfx

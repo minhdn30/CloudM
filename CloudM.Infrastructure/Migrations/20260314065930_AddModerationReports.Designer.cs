@@ -3,6 +3,7 @@ using System;
 using CloudM.Infrastructure.Data;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 
@@ -11,9 +12,11 @@ using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 namespace CloudM.Infrastructure.Migrations
 {
     [DbContext(typeof(AppDbContext))]
-    partial class AppDbContextModelSnapshot : ModelSnapshot
+    [Migration("20260314065930_AddModerationReports")]
+    partial class AddModerationReports
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder
@@ -724,9 +727,6 @@ namespace CloudM.Infrastructure.Migrations
                         .HasMaxLength(100)
                         .HasColumnType("varchar(100)");
 
-                    b.Property<Guid?>("ReporterAccountId")
-                        .HasColumnType("uuid");
-
                     b.Property<DateTime?>("ResolvedAt")
                         .HasColumnType("timestamp with time zone");
 
@@ -753,11 +753,6 @@ namespace CloudM.Infrastructure.Migrations
                     b.HasIndex("CreatedByAdminId");
 
                     b.HasIndex("ResolvedByAdminId");
-
-                    b.HasIndex("ReporterAccountId", "TargetType", "TargetId")
-                        .IsUnique()
-                        .HasDatabaseName("IX_ModerationReports_UserSubmittedPendingUnique")
-                        .HasFilter("\"ReporterAccountId\" IS NOT NULL AND \"SourceType\" = 1 AND \"Status\" IN (0, 1)");
 
                     b.HasIndex("Status", "CreatedAt", "ModerationReportId")
                         .HasDatabaseName("IX_ModerationReports_Status_CreatedAt_ReportId");
@@ -1618,19 +1613,12 @@ namespace CloudM.Infrastructure.Migrations
                         .HasForeignKey("CreatedByAdminId")
                         .OnDelete(DeleteBehavior.SetNull);
 
-                    b.HasOne("CloudM.Domain.Entities.Account", "ReporterAccount")
-                        .WithMany()
-                        .HasForeignKey("ReporterAccountId")
-                        .OnDelete(DeleteBehavior.SetNull);
-
                     b.HasOne("CloudM.Domain.Entities.Account", "ResolvedByAdmin")
                         .WithMany()
                         .HasForeignKey("ResolvedByAdminId")
                         .OnDelete(DeleteBehavior.SetNull);
 
                     b.Navigation("CreatedByAdmin");
-
-                    b.Navigation("ReporterAccount");
 
                     b.Navigation("ResolvedByAdmin");
                 });

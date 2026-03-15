@@ -1,0 +1,94 @@
+services:
+  caddy:
+    image: caddy:2.10-alpine
+    restart: unless-stopped
+    depends_on:
+      - api
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      API_DOMAIN: ${API_DOMAIN}
+      API_UPSTREAM: api:10000
+      ACME_EMAIL: ${ACME_EMAIL}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    env_file:
+      - .env.production
+    environment:
+      ASPNETCORE_ENVIRONMENT: Production
+      PORT: 10000
+      ConnectionStrings__Default: Host=postgres;Port=5432;Database=${POSTGRES_DB};Username=${POSTGRES_USER};Password=${POSTGRES_PASSWORD};SSL Mode=Disable;Pooling=true;Maximum Pool Size=100
+      ConnectionStrings__Redis: redis:6379,abortConnect=false
+    expose:
+      - "10000"
+
+  migrator:
+    image: mcr.microsoft.com/dotnet/sdk:8.0
+    profiles:
+      - tools
+    working_dir: /src
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env.production
+    environment:
+      ASPNETCORE_ENVIRONMENT: Production
+      ConnectionStrings__Default: Host=postgres;Port=5432;Database=${POSTGRES_DB};Username=${POSTGRES_USER};Password=${POSTGRES_PASSWORD};SSL Mode=Disable;Pooling=true;Maximum Pool Size=100
+      ConnectionStrings__Redis: redis:6379,abortConnect=false
+    volumes:
+      - ./:/src
+    command: >
+      bash -lc "dotnet restore ./CloudM.API/CloudM.API.csproj &&
+      dotnet tool install --global dotnet-ef --version 8.* &&
+      export PATH=\"$$PATH:/root/.dotnet/tools\" &&
+      dotnet ef database update --project ./CloudM.Infrastructure/CloudM.Infrastructure.csproj --startup-project ./CloudM.API/CloudM.API.csproj"
+
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --maxmemory
+      - ${REDIS_MAXMEMORY}
+      - --maxmemory-policy
+      - allkeys-lru
+    volumes:
+      - redis_data:/data
+
+volumes:
+  caddy_data:
+  caddy_config:
+  postgres_data:
+  redis_data:

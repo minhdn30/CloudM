@@ -9,15 +9,18 @@ namespace CloudM.Application.Services.AuthServices
     public class RedisLoginRateLimitService : ILoginRateLimitService
     {
         private readonly IConnectionMultiplexer _redis;
+        private readonly MemoryLoginRateLimitService _memoryFallbackService;
         private readonly LoginSecurityOptions _options;
         private readonly string _keyPrefix;
 
         public RedisLoginRateLimitService(
             IConnectionMultiplexer redis,
+            MemoryLoginRateLimitService memoryFallbackService,
             IOptions<LoginSecurityOptions> options,
             IConfiguration configuration)
         {
             _redis = redis;
+            _memoryFallbackService = memoryFallbackService;
             _options = NormalizeOptions(options.Value);
             _keyPrefix = (configuration["Redis:KeyPrefix"] ?? "cloudm").Trim();
         }
@@ -58,8 +61,7 @@ namespace CloudM.Application.Services.AuthServices
             }
             catch (RedisException)
             {
-                // Fail-open for login availability when Redis is temporarily unavailable.
-                return;
+                await _memoryFallbackService.EnforceLoginAllowedAsync(normalizedEmail, normalizedIp, nowUtc);
             }
         }
 
@@ -114,8 +116,7 @@ namespace CloudM.Application.Services.AuthServices
             }
             catch (RedisException)
             {
-                // Best-effort recording only; do not break login flow on Redis outage.
-                return;
+                await _memoryFallbackService.RecordFailedAttemptAsync(normalizedEmail, normalizedIp, nowUtc);
             }
         }
 
@@ -144,11 +145,11 @@ namespace CloudM.Application.Services.AuthServices
                 }
 
                 await database.KeyDeleteAsync(keysToDelete.ToArray());
+                await _memoryFallbackService.ClearFailedAttemptsAsync(normalizedEmail, normalizedIp, nowUtc);
             }
             catch (RedisException)
             {
-                // Best-effort cleanup only; do not break login flow on Redis outage.
-                return;
+                await _memoryFallbackService.ClearFailedAttemptsAsync(normalizedEmail, normalizedIp, nowUtc);
             }
         }
 

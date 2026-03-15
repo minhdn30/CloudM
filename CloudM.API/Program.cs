@@ -14,8 +14,17 @@ using CloudM.Application.Helpers.StoryHelpers;
 using CloudM.Application.Helpers.SwaggerHelpers;
 using CloudM.Application.Mapping;
 using CloudM.Application.Services.AccountServices;
+using CloudM.Application.Services.AccountSearchHistoryServices;
 using CloudM.Application.Services.AccountSettingServices;
+using CloudM.Application.Services.AdminAccountLookupServices;
+using CloudM.Application.Services.AdminAccountStatusServices;
+using CloudM.Application.Services.AdminAuditLogServices;
+using CloudM.Application.Services.AdminAuthServices;
+using CloudM.Application.Services.AdminModerationServices;
+using CloudM.Application.Services.AdminPortalServices;
+using CloudM.Application.Services.AdminReportServices;
 using CloudM.Application.Services.AuthServices;
+using CloudM.Application.Services.BlockServices;
 using CloudM.Infrastructure.Services.Cloudinary;
 using CloudM.Application.Services.CommentReactServices;
 using CloudM.Application.Services.CommentServices;
@@ -35,6 +44,7 @@ using CloudM.Application.Services.PostReactServices;
 using CloudM.Application.Services.PostSaveServices;
 using CloudM.Application.Services.PostServices;
 using CloudM.Application.Services.PostTagServices;
+using CloudM.Application.Services.ReportServices;
 using CloudM.Application.Services.NotificationServices;
 using CloudM.Application.Services.RealtimeServices;
 using CloudM.Application.Services.StoryServices;
@@ -44,7 +54,16 @@ using CloudM.API.Services;
 using CloudM.Infrastructure.Data;
 using CloudM.Domain.Exceptions;
 using CloudM.Infrastructure.Repositories.Accounts;
+using CloudM.Infrastructure.Repositories.AccountBlocks;
+using CloudM.Infrastructure.Repositories.AccountSearchHistories;
 using CloudM.Infrastructure.Repositories.AccountSettingRepos;
+using CloudM.Infrastructure.Repositories.AdminAccountLookups;
+using CloudM.Infrastructure.Repositories.AdminAccountStatuses;
+using CloudM.Infrastructure.Repositories.AdminAuditLogs;
+using CloudM.Infrastructure.Repositories.AdminAuths;
+using CloudM.Infrastructure.Repositories.AdminModerations;
+using CloudM.Infrastructure.Repositories.AdminPortals;
+using CloudM.Infrastructure.Repositories.AdminReports;
 using CloudM.Infrastructure.Repositories.CommentReacts;
 using CloudM.Infrastructure.Repositories.Comments;
 using CloudM.Infrastructure.Repositories.ConversationMembers;
@@ -63,6 +82,7 @@ using CloudM.Infrastructure.Repositories.PostReacts;
 using CloudM.Infrastructure.Repositories.PostSaves;
 using CloudM.Infrastructure.Repositories.Posts;
 using CloudM.Infrastructure.Repositories.PostTags;
+using CloudM.Infrastructure.Repositories.Reports;
 using CloudM.Infrastructure.Repositories.Notifications;
 using CloudM.Infrastructure.Repositories.Presences;
 using CloudM.Infrastructure.Repositories.Stories;
@@ -71,9 +91,11 @@ using CloudM.Infrastructure.Repositories.StoryViews;
 using CloudM.Infrastructure.Repositories.UnitOfWork;
 using System;
 using System.Linq;
+using System.Security.Claims;
 using System.Text;
 using System.Text.Json;
 using StackExchange.Redis;
+using Resend;
 
 
 namespace CloudM.API
@@ -107,6 +129,8 @@ namespace CloudM.API
                 }
             }
 
+            var redisMultiplexer = TryCreateRedisConnectionMultiplexer(builder.Configuration);
+
             builder.Services.AddDbContext<AppDbContext>(options =>
                 options.UseNpgsql(connectionString, npgsqlOptions =>
                 {
@@ -114,10 +138,13 @@ namespace CloudM.API
                     npgsqlOptions.CommandTimeout(30);
                 })
             );
+            builder.Services.AddMemoryCache();
 
             // Repositories
             builder.Services.AddScoped<IAccountRepository, AccountRepository>();
-            builder.Services.AddScoped<IAccountSettingRepository, AccountSettingRepository>();
+            builder.Services.AddScoped<IAccountBlockRepository, AccountBlockRepository>();
+            builder.Services.AddScoped<IAccountSearchHistoryRepository, AccountSearchHistoryRepository>();
+            builder.Services.AddScoped<IAccountSettingRepository, AccountSettingRepository>();           
             builder.Services.AddScoped<IEmailVerificationRepository, EmailVerificationRepository>();
             builder.Services.AddScoped<IExternalLoginRepository, ExternalLoginRepository>();
             builder.Services.AddScoped<IFollowRepository, FollowRepository>();
@@ -131,6 +158,7 @@ namespace CloudM.API
             builder.Services.AddScoped<IStoryRepository, StoryRepository>();
             builder.Services.AddScoped<IStoryHighlightRepository, StoryHighlightRepository>();
             builder.Services.AddScoped<IStoryViewRepository, StoryViewRepository>();
+            builder.Services.AddScoped<IReportRepository, ReportRepository>();
             builder.Services.AddScoped<ICommentReactRepository, CommentReactRepository>();
             builder.Services.AddScoped<IConversationRepository, ConversationRepository>();
             builder.Services.AddScoped<IConversationMemberRepository, ConversationMemberRepository>();
@@ -144,9 +172,20 @@ namespace CloudM.API
             builder.Services.AddScoped<INotificationOutboxRepository, NotificationOutboxRepository>();
             builder.Services.AddScoped<IUnitOfWork, UnitOfWork>();
 
+            //admin
+            builder.Services.AddScoped<IAdminAccountLookupRepository, AdminAccountLookupRepository>();
+            builder.Services.AddScoped<IAdminAccountStatusRepository, AdminAccountStatusRepository>();
+            builder.Services.AddScoped<IAdminAuditLogRepository, AdminAuditLogRepository>();
+            builder.Services.AddScoped<IAdminAuthRepository, AdminAuthRepository>();
+            builder.Services.AddScoped<IAdminModerationRepository, AdminModerationRepository>();
+            builder.Services.AddScoped<IAdminPortalRepository, AdminPortalRepository>();
+            builder.Services.AddScoped<IAdminReportRepository, AdminReportRepository>();
+            
             // Services
             builder.Services.Configure<LoginSecurityOptions>(
                 builder.Configuration.GetSection("LoginSecurity"));
+            builder.Services.Configure<ReportSecurityOptions>(
+                builder.Configuration.GetSection("ReportSecurity"));
             builder.Services.Configure<EmailVerificationSecurityOptions>(
                 builder.Configuration.GetSection("EmailVerification"));
             builder.Services.Configure<GoogleAuthOptions>(
@@ -159,31 +198,56 @@ namespace CloudM.API
                 builder.Configuration.GetSection("NotificationOptions"));
             builder.Services.Configure<FollowAutoAcceptOptions>(
                 builder.Configuration.GetSection("FollowAutoAccept"));
-            builder.Services.AddSingleton<IConnectionMultiplexer>(_ =>
+            builder.Services.Configure<FeedRankingOptions>(
+                builder.Configuration.GetSection("FeedRanking"));
+            builder.Services.Configure<ResendClientOptions>(options =>
             {
-                var redisConnectionString = BuildRedisConnectionString(builder.Configuration);
-                return ConnectionMultiplexer.Connect(redisConnectionString);
+                options.ApiToken = builder.Configuration["Email:ResendApiKey"] ?? string.Empty;
             });
 
+            if (redisMultiplexer != null)
+            {
+                builder.Services.AddSingleton<IConnectionMultiplexer>(redisMultiplexer);
+            }
+            builder.Services.AddSingleton<MemoryLoginRateLimitService>();
+            builder.Services.AddSingleton<MemoryReportSubmissionGuardService>();
+            builder.Services.AddSingleton<MemoryPresenceSnapshotRateLimiter>();
+            builder.Services.AddSingleton<MemoryPresenceHiddenBroadcastTracker>();
+
             builder.Services.AddScoped<IAuthService, AuthService>();
+            
             builder.Services.AddScoped<IExternalIdentityProvider, GoogleExternalIdentityProvider>();
             builder.Services.AddScoped<IPasswordResetService, PasswordResetService>();
-            builder.Services.AddScoped<ILoginRateLimitService, RedisLoginRateLimitService>();
             builder.Services.AddScoped<IAccountService, AccountService>();
+            builder.Services.AddScoped<IAccountSearchHistoryService, AccountSearchHistoryService>();
+            builder.Services.AddScoped<IBlockService, BlockService>();
             builder.Services.AddScoped<IAccountSettingService, AccountSettingService>();
             builder.Services.AddSingleton<ICloudinaryDeleteBackgroundQueue, CloudinaryDeleteBackgroundQueue>();
             builder.Services.AddHostedService<CloudinaryDeleteWorkerHostedService>();
             builder.Services.AddSingleton<ICloudinaryService, CloudinaryService>();
 
-            builder.Services.AddTransient<IEmailService, EmailService>();
+            //admin
+            builder.Services.AddScoped<IAdminAccountLookupService, AdminAccountLookupService>();
+            builder.Services.AddScoped<IAdminAccountStatusService, AdminAccountStatusService>();
+            builder.Services.AddScoped<IAdminAuditLogService, AdminAuditLogService>();
+            builder.Services.AddScoped<IAdminAuthService, AdminAuthService>();
+            builder.Services.AddScoped<IAdminModerationService, AdminModerationService>();
+            builder.Services.AddScoped<IAdminPortalService, AdminPortalService>();
+            builder.Services.AddScoped<IAdminReportService, AdminReportService>();
+
+            builder.Services.AddHttpClient<ResendClient>();
+            builder.Services.AddTransient<IResend, ResendClient>();
+            builder.Services.AddTransient<EmailService>();
+            builder.Services.AddTransient<ResendEmailService>();
+            builder.Services.AddTransient<IEmailService>(EmailProviderResolver.Resolve);
             builder.Services.AddScoped<IEmailVerificationService, EmailVerificationService>();
-            builder.Services.AddScoped<IEmailVerificationRateLimitService, RedisEmailVerificationRateLimitService>();
             builder.Services.AddScoped<IJwtService, JwtService>();
             builder.Services.AddScoped<IFollowService, FollowService>();
             builder.Services.AddScoped<IFollowAutoAcceptService, FollowAutoAcceptService>();
             builder.Services.AddScoped<IPostService, PostService>();
             builder.Services.AddScoped<IPostTagService, PostTagService>();
             builder.Services.AddScoped<IPostSaveService, PostSaveService>();
+            builder.Services.AddScoped<IReportService, ReportService>();
             builder.Services.AddScoped<IStoryService, StoryService>();
             builder.Services.AddScoped<IStoryHighlightService, StoryHighlightService>();
             builder.Services.AddScoped<IStoryViewService, StoryViewService>();
@@ -204,17 +268,40 @@ namespace CloudM.API
 
             // Realtime Services
             builder.Services.AddScoped<IRealtimeService, RealtimeService>();
-            builder.Services.AddScoped<IOnlinePresenceService, OnlinePresenceService>();
             builder.Services.AddHostedService<EmailVerificationCleanupHostedService>();
             builder.Services.AddHostedService<OnlinePresenceCleanupHostedService>();
             builder.Services.AddHostedService<NotificationOutboxWorkerHostedService>();
             builder.Services.AddHostedService<FollowAutoAcceptWorkerHostedService>();
+
+            if (redisMultiplexer != null)
+            {
+                builder.Services.AddScoped<ILoginRateLimitService, RedisLoginRateLimitService>();
+                builder.Services.AddScoped<IReportSubmissionGuardService, RedisReportSubmissionGuardService>();
+                builder.Services.AddScoped<IEmailVerificationRateLimitService, RedisEmailVerificationRateLimitService>();
+                builder.Services.AddScoped<IOnlinePresenceService, OnlinePresenceService>();
+            }
+            else
+            {
+                builder.Services.AddScoped<ILoginRateLimitService>(
+                    provider => provider.GetRequiredService<MemoryLoginRateLimitService>());
+                builder.Services.AddScoped<IReportSubmissionGuardService>(
+                    provider => provider.GetRequiredService<MemoryReportSubmissionGuardService>());
+                builder.Services.AddScoped<IEmailVerificationRateLimitService, UnavailableEmailVerificationRateLimitService>();
+                builder.Services.AddScoped<IOnlinePresenceService, NoOpOnlinePresenceService>();
+            }
 
             // Helpers
             builder.Services.AddScoped<IStoryRingStateHelper, StoryRingStateHelper>();
             builder.Services.AddScoped<IFileTypeDetector, FileTypeDetector>();
             var jwtSettings = builder.Configuration.GetSection("Jwt");
             var jwtKey = RequireConfiguredValue(jwtSettings["Key"], "Jwt:Key");
+            builder.Services.PostConfigure<FeedRankingOptions>(options =>
+            {
+                options.CursorSigningKey = string.IsNullOrWhiteSpace(options.CursorSigningKey)
+                    ? jwtKey
+                    : options.CursorSigningKey;
+                options.Normalize();
+            });
 
             // JWT
             builder.Services.AddAuthentication(options =>
@@ -256,12 +343,62 @@ namespace CloudM.API
                         return Task.CompletedTask;
                     },
 
+                    OnTokenValidated = async context =>
+                    {
+                        var roleClaim = context.Principal?.FindFirst(ClaimTypes.Role)?.Value;
+                        if (!string.Equals(roleClaim, "Admin", StringComparison.Ordinal))
+                        {
+                            return;
+                        }
+
+                        var accountIdClaim =
+                            context.Principal?.FindFirst("AccountId")?.Value
+                            ?? context.Principal?.FindFirst(ClaimTypes.NameIdentifier)?.Value;
+
+                        if (!Guid.TryParse(accountIdClaim, out var accountId))
+                        {
+                            context.Fail("Admin session is no longer valid.");
+                            return;
+                        }
+
+                        var tokenSecurityStamp = context.Principal?.FindFirst("adminSecurityStamp")?.Value;
+                        if (string.IsNullOrWhiteSpace(tokenSecurityStamp))
+                        {
+                            context.Fail("Admin session is no longer valid.");
+                            return;
+                        }
+
+                        var adminAuthRepository = context.HttpContext.RequestServices.GetRequiredService<IAdminAuthRepository>();
+                        var jwtService = context.HttpContext.RequestServices.GetRequiredService<IJwtService>();
+                        var adminAccount = await adminAuthRepository.GetAdminByIdAsync(accountId);
+                        if (adminAccount == null)
+                        {
+                            context.Fail("Admin session is no longer valid.");
+                            return;
+                        }
+
+                        var expectedSecurityStamp = jwtService.GenerateAdminSecurityStamp(adminAccount);
+                        if (!string.Equals(tokenSecurityStamp, expectedSecurityStamp, StringComparison.Ordinal))
+                        {
+                            context.Fail("Admin session is no longer valid.");
+                        }
+                    },
+
                     OnAuthenticationFailed = context =>
                     {
                         return Task.CompletedTask;
                     }
                 };
 
+            });
+
+            builder.Services.AddAuthorization(options =>
+            {
+                options.AddPolicy("AdminOnly", policy =>
+                {
+                    policy.RequireAuthenticatedUser();
+                    policy.RequireRole("Admin");
+                });
             });
 
 
@@ -405,13 +542,48 @@ namespace CloudM.API
             return csb.ToString();
         }
 
-        private static string BuildRedisConnectionString(IConfiguration configuration)
+        private static IConnectionMultiplexer? TryCreateRedisConnectionMultiplexer(IConfiguration configuration)
+        {
+            var redisConnectionString = BuildRedisConnectionString(configuration);
+            if (string.IsNullOrWhiteSpace(redisConnectionString))
+            {
+                Console.WriteLine("[Redis] Disabled: connection string is not configured. Running in degraded mode.");
+                return null;
+            }
+
+            try
+            {
+                var multiplexer = ConnectionMultiplexer.Connect(redisConnectionString);
+                if (!multiplexer.IsConnected)
+                {
+                    multiplexer.Dispose();
+                    Console.WriteLine("[Redis] Disabled: no active Redis connection. Running in degraded mode.");
+                    return null;
+                }
+
+                Console.WriteLine("[Redis] Enabled.");
+                return multiplexer;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[Redis] Disabled: {ex.GetType().Name}. Running in degraded mode.");
+                return null;
+            }
+        }
+
+        private static string? BuildRedisConnectionString(IConfiguration configuration)
         {
             var rawConnectionString = FirstNonEmpty(
                 configuration.GetConnectionString("Redis"),
                 configuration["Redis:ConnectionString"]);
 
-            return RequireConfiguredValue(rawConnectionString, "ConnectionStrings:Redis");
+            var sanitized = rawConnectionString?.Trim().Trim('"', '\'');
+            if (string.IsNullOrWhiteSpace(sanitized) || IsPlaceholderValue(sanitized))
+            {
+                return null;
+            }
+
+            return sanitized;
         }
 
         private static NpgsqlConnectionStringBuilder BuildFromDatabaseUrl(string databaseUrl)

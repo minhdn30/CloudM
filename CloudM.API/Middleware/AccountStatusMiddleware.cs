@@ -1,5 +1,6 @@
 using Microsoft.AspNetCore.Http;
 using CloudM.Domain.Enums;
+using CloudM.Domain.Helpers;
 using CloudM.Infrastructure.Repositories.Accounts;
 using System.Security.Claims;
 using static CloudM.Domain.Exceptions.CustomExceptions;
@@ -30,10 +31,17 @@ namespace CloudM.API.Middleware
                     return;
                 }
 
+                var isAdminPath = path.StartsWith("/api/admin/");
+
                 var account = await accountRepository.GetAccountById(accountId);
                 if (account != null && account.Status != AccountStatusEnum.Active)
                 {
                     throw new ForbiddenException($"Your account is currently {account.Status}. Please reactivate or contact support.");
+                }
+
+                if (account != null && !isAdminPath && !SocialRoleRules.IsSocialEligible(account))
+                {
+                    throw new ForbiddenException("This account cannot access social features.");
                 }
             }
 

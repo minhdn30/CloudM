@@ -6,8 +6,10 @@ using CloudM.Application.Helpers.StoryHelpers;
 using CloudM.Application.Helpers.ValidationHelpers;
 using CloudM.Domain.Entities;
 using CloudM.Domain.Enums;
+using CloudM.Domain.Helpers;
 using CloudM.Infrastructure.Models;
 using CloudM.Infrastructure.Repositories.Accounts;
+using CloudM.Infrastructure.Repositories.AccountBlocks;
 using CloudM.Infrastructure.Repositories.CommentReacts;
 using CloudM.Infrastructure.Repositories.Comments;
 using CloudM.Infrastructure.Repositories.Follows;
@@ -39,10 +41,12 @@ namespace CloudM.Application.Services.CommentServices
         private readonly IRealtimeService _realtimeService;
         private readonly IUnitOfWork _unitOfWork;
         private readonly IStoryRingStateHelper _storyRingStateHelper;
+        private readonly IAccountBlockRepository _accountBlockRepository;
 
         public CommentService(ICommentRepository commentRepository, ICommentReactRepository commentReactRepository, IPostRepository postRepository,
             IAccountRepository accountRepository, IFollowRepository followRepository, IMapper mapper, INotificationService notificationService, IRealtimeService realtimeService,
-            IUnitOfWork unitOfWork, IStoryViewService? storyViewService = null, IStoryRingStateHelper? storyRingStateHelper = null)
+            IUnitOfWork unitOfWork, IStoryViewService? storyViewService = null, IStoryRingStateHelper? storyRingStateHelper = null,
+            IAccountBlockRepository? accountBlockRepository = null)
         {
             _commentRepository = commentRepository;
             _commentReactRepository = commentReactRepository;
@@ -54,6 +58,7 @@ namespace CloudM.Application.Services.CommentServices
             _realtimeService = realtimeService;
             _unitOfWork = unitOfWork;
             _storyRingStateHelper = storyRingStateHelper ?? new StoryRingStateHelper(storyViewService);
+            _accountBlockRepository = accountBlockRepository ?? NullAccountBlockRepository.Instance;
         }
 
         public CommentService(
@@ -91,6 +96,8 @@ namespace CloudM.Application.Services.CommentServices
             }
 
             await ValidatePostPrivacyAsync(post, accountId, "comment on");
+            if (await _accountBlockRepository.IsBlockedEitherWayAsync(accountId, post.AccountId))
+                throw new BadRequestException("This content is no longer available.");
  
             var account = await _accountRepository.GetAccountById(accountId);
             if(account == null)
@@ -98,7 +105,7 @@ namespace CloudM.Application.Services.CommentServices
                 throw new BadRequestException($"Account with ID {accountId} not found.");
             }
 
-            if (account.Status != AccountStatusEnum.Active)
+            if (!SocialRoleRules.IsSocialEligible(account))
                 throw new ForbiddenException("You must reactivate your account to comment.");
             Comment? parentComment = null;
             if (request.ParentCommentId.HasValue)
@@ -113,12 +120,15 @@ namespace CloudM.Application.Services.CommentServices
 
                     throw new BadRequestException(message);
                 }
+
+                if (await _accountBlockRepository.IsBlockedEitherWayAsync(accountId, parentComment.AccountId))
+                    throw new BadRequestException("This content is no longer available.");
             }
 
             var comment = _mapper.Map<Comment>(request);
             comment.PostId = postId;
             comment.AccountId = accountId;
-            var sanitizeResult = await SanitizeMentionsAsync(comment.Content, post);
+            var sanitizeResult = await SanitizeMentionsAsync(comment.Content, post, accountId);
             comment.Content = sanitizeResult.SanitizedContent;
 
             return await _unitOfWork.ExecuteInTransactionAsync(async () =>
@@ -143,7 +153,7 @@ namespace CloudM.Application.Services.CommentServices
                     result.Owner.StoryRingState = await ResolveStoryRingStateAsync(accountId, accountId);
                 }
 
-                result.TotalCommentCount = await _commentRepository.CountCommentsByPostId(postId);
+                result.TotalCommentCount = await _commentRepository.CountCommentsByPostId(postId, accountId);
 
                 // Calculate business rules
                 result.CanEdit = true; // Newly created comment by the user
@@ -153,7 +163,7 @@ namespace CloudM.Application.Services.CommentServices
                 int? parentReplyCount = null;
                 if (result.ParentCommentId.HasValue)
                 {
-                    parentReplyCount = await _commentRepository.CountCommentRepliesAsync(result.ParentCommentId.Value);
+                    parentReplyCount = await _commentRepository.CountCommentRepliesAsync(result.ParentCommentId.Value, accountId);
                 }
                 await _realtimeService.NotifyCommentCreatedAsync(postId, result, parentReplyCount);
 
@@ -187,7 +197,7 @@ namespace CloudM.Application.Services.CommentServices
 
             // Only update content as requested
             var previousMentionAccountIds = ExtractCanonicalMentionAccountIds(comment.Content);
-            var sanitizeResult = await SanitizeMentionsAsync(request.Content, post);
+            var sanitizeResult = await SanitizeMentionsAsync(request.Content, post, accountId);
             comment.Content = sanitizeResult.SanitizedContent;
             comment.UpdatedAt = DateTime.UtcNow;
 
@@ -238,8 +248,8 @@ namespace CloudM.Application.Services.CommentServices
             }
 
             result.ReactCount = await _commentReactRepository.CountCommentReactAsync(comment.CommentId);
-            result.ReplyCount = await _commentRepository.CountCommentRepliesAsync(comment.CommentId);
-            result.TotalCommentCount = await _commentRepository.CountCommentsByPostId(comment.PostId);
+            result.ReplyCount = await _commentRepository.CountCommentRepliesAsync(comment.CommentId, accountId);
+            result.TotalCommentCount = await _commentRepository.CountCommentsByPostId(comment.PostId, accountId);
             
             // Calculate business rules
             result.CanEdit = true;
@@ -374,6 +384,10 @@ namespace CloudM.Application.Services.CommentServices
                             notificationAt,
                             keepWhenEmpty: true);
                     }
+                    
+                    await EnqueueCommentReactDeactivateAllAsync(
+                        deletedComment,
+                        notificationAt);
                 }
 
                 // Get updated counts logic
@@ -382,11 +396,11 @@ namespace CloudM.Application.Services.CommentServices
 
                 if (parentId.HasValue)
                 {
-                    parentReplyCount = await _commentRepository.CountCommentRepliesAsync(parentId.Value);
+                    parentReplyCount = await _commentRepository.CountCommentRepliesAsync(parentId.Value, accountId);
                 }
                 else
                 {
-                    totalComments = await _commentRepository.CountCommentsByPostId(postId);
+                    totalComments = await _commentRepository.CountCommentsByPostId(postId, accountId);
                 }
 
                 var deleteResult = new CommentDeleteResult
@@ -404,7 +418,7 @@ namespace CloudM.Application.Services.CommentServices
             });
         }
 
-        public async Task<PagedResponse<CommentResponse>> GetCommentsByPostIdAsync(Guid postId, Guid? currentId, int page, int pageSize)
+        public async Task<CommentCursorResponse> GetCommentsByPostIdAsync(Guid postId, Guid? currentId, DateTime? cursorCreatedAt, Guid? cursorCommentId, int pageSize, Guid? priorityCommentId = null)
         {
             var post = await _postRepository.GetPostBasicInfoById(postId);
             if (post == null)
@@ -412,7 +426,7 @@ namespace CloudM.Application.Services.CommentServices
 
             await ValidatePostPrivacyAsync(post, currentId, "view comments on");
 
-            var (items, totalItems) = await _commentRepository.GetCommentsByPostIdWithReplyCountAsync(postId, currentId, page, pageSize);
+            var (items, totalItems, nextCursorCreatedAt, nextCursorCommentId) = await _commentRepository.GetCommentsByPostIdWithReplyCountAsync(postId, currentId, cursorCreatedAt, cursorCommentId, pageSize, priorityCommentId);
 
             var responseItems = items.Select(item =>
             {
@@ -424,15 +438,20 @@ namespace CloudM.Application.Services.CommentServices
 
             await ApplyStoryRingStatesForCommentOwnersAsync(currentId, responseItems);
 
-            return new PagedResponse<CommentResponse>
+            return new CommentCursorResponse
             {
                 Items = responseItems,
-                TotalItems = totalItems,
-                Page = page,
-                PageSize = pageSize
+                TotalCount = totalItems,
+                NextCursor = nextCursorCreatedAt.HasValue && nextCursorCommentId.HasValue
+                    ? new CommentNextCursorResponse
+                    {
+                        CreatedAt = nextCursorCreatedAt.Value,
+                        CommentId = nextCursorCommentId.Value
+                    }
+                    : null
             };
         }
-        public async Task<PagedResponse<CommentResponse>> GetRepliesByCommentIdAsync(Guid commentId, Guid? currentId, int page, int pageSize)
+        public async Task<CommentCursorResponse> GetRepliesByCommentIdAsync(Guid commentId, Guid? currentId, DateTime? cursorCreatedAt, Guid? cursorCommentId, int pageSize, Guid? priorityReplyId = null)
         {
             var comment = await _commentRepository.GetCommentById(commentId);
             if (comment == null)
@@ -444,7 +463,7 @@ namespace CloudM.Application.Services.CommentServices
 
             await ValidatePostPrivacyAsync(post, currentId, "view replies on");
 
-            var (items, totalItems) = await _commentRepository.GetRepliesByCommentIdAsync(commentId, currentId, page, pageSize);
+            var (items, totalItems, nextCursorCreatedAt, nextCursorCommentId) = await _commentRepository.GetRepliesByCommentIdAsync(commentId, currentId, cursorCreatedAt, cursorCommentId, pageSize, priorityReplyId);
 
             var responseItems = items.Select(item =>
             {
@@ -456,12 +475,17 @@ namespace CloudM.Application.Services.CommentServices
 
             await ApplyStoryRingStatesForCommentOwnersAsync(currentId, responseItems);
 
-            return new PagedResponse<CommentResponse>
+            return new CommentCursorResponse
             {
                 Items = responseItems,
-                TotalItems = totalItems,
-                Page = page,
-                PageSize = pageSize
+                TotalCount = totalItems,
+                NextCursor = nextCursorCreatedAt.HasValue && nextCursorCommentId.HasValue
+                    ? new CommentNextCursorResponse
+                    {
+                        CreatedAt = nextCursorCreatedAt.Value,
+                        CommentId = nextCursorCommentId.Value
+                    }
+                    : null
             };
         }
         public async Task<CommentResponse?> GetCommentByIdAsync(Guid commentId)
@@ -527,7 +551,7 @@ namespace CloudM.Application.Services.CommentServices
             return await _storyRingStateHelper.ResolveAsync(currentId, targetAccountId);
         }
 
-        private async Task<CommentMentionSanitizeResult> SanitizeMentionsAsync(string? content, Post post)
+        private async Task<CommentMentionSanitizeResult> SanitizeMentionsAsync(string? content, Post post, Guid currentId)
         {
             var safeContent = content ?? string.Empty;
             var mentionTokens = MentionParser.ExtractTokens(safeContent);
@@ -569,6 +593,28 @@ namespace CloudM.Application.Services.CommentServices
                 .GroupBy(x => x.AccountId)
                 .Select(g => g.First())
                 .ToList();
+
+            var blockedAccountIds = (await _accountBlockRepository.GetRelationsAsync(
+                    currentId,
+                    candidateAccounts.Select(x => x.AccountId)))
+                .Where(x => x.IsBlockedEitherWay)
+                .Select(x => x.TargetId)
+                .ToHashSet();
+
+            if (blockedAccountIds.Count > 0)
+            {
+                accountById = accountById
+                    .Where(x => !blockedAccountIds.Contains(x.Key))
+                    .ToDictionary(x => x.Key, x => x.Value);
+
+                accountByUsername = accountByUsername
+                    .Where(x => !blockedAccountIds.Contains(x.Value.AccountId))
+                    .ToDictionary(x => x.Key, x => x.Value, StringComparer.OrdinalIgnoreCase);
+
+                candidateAccounts = candidateAccounts
+                    .Where(x => !blockedAccountIds.Contains(x.AccountId))
+                    .ToList();
+            }
 
             var visibilityCandidateIds = candidateAccounts
                 .Where(x => x.AccountId != post.AccountId)
@@ -763,6 +809,36 @@ namespace CloudM.Application.Services.CommentServices
                     OccurredAt = occurredAt
                 });
             }
+        }
+
+        private async Task EnqueueCommentReactDeactivateAllAsync(
+            Comment comment,
+            DateTime occurredAt)
+        {
+            if (comment.AccountId == Guid.Empty || comment.PostId == Guid.Empty)
+            {
+                return;
+            }
+
+            var isReply = comment.ParentCommentId.HasValue;
+            await _notificationService.EnqueueAggregateEventAsync(new NotificationAggregateEvent
+            {
+                RecipientId = comment.AccountId,
+                Action = NotificationAggregateActionEnum.DeactivateAll,
+                Type = isReply ? NotificationTypeEnum.ReplyReact : NotificationTypeEnum.CommentReact,
+                AggregateKey = isReply
+                    ? NotificationAggregateKeys.ReplyReact(comment.CommentId)
+                    : NotificationAggregateKeys.CommentReact(comment.CommentId),
+                SourceType = isReply
+                    ? NotificationSourceTypeEnum.ReplyReact
+                    : NotificationSourceTypeEnum.CommentReact,
+                SourceId = Guid.Empty,
+                ActorId = null,
+                TargetKind = NotificationTargetKindEnum.Post,
+                TargetId = comment.PostId,
+                KeepWhenEmpty = false,
+                OccurredAt = occurredAt
+            });
         }
 
         private static HashSet<Guid> ExtractCanonicalMentionAccountIds(string? content)

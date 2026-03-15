@@ -1,7 +1,9 @@
 ﻿using Microsoft.EntityFrameworkCore;
 using CloudM.Domain.Entities;
 using CloudM.Domain.Enums;
+using CloudM.Domain.Helpers;
 using CloudM.Infrastructure.Data;
+using CloudM.Infrastructure.Helpers;
 using CloudM.Infrastructure.Models;
 using System;
 using System.Collections.Generic;
@@ -18,24 +20,95 @@ namespace CloudM.Infrastructure.Repositories.Comments
         {
             _context = context;
         }
-        public async Task<(IEnumerable<CommentWithReplyCountModel> items, int totalItems)> GetCommentsByPostIdWithReplyCountAsync(Guid postId, Guid? currentId, int page, int pageSize)
+        public async Task<(IEnumerable<CommentWithReplyCountModel> items, int totalItems, DateTime? nextCursorCreatedAt, Guid? nextCursorCommentId)> GetCommentsByPostIdWithReplyCountAsync(Guid postId, Guid? currentId, DateTime? cursorCreatedAt, Guid? cursorCommentId, int pageSize, Guid? priorityCommentId = null)
         {
-            if (page <= 0) page = 1;
+            if (pageSize <= 0) pageSize = 10;
 
-            var totalItems = await _context.Comments
-                .Where(c => c.PostId == postId && c.ParentCommentId == null && c.Account.Status == AccountStatusEnum.Active)
-                .CountAsync();
+            var applyBlockFilter = currentId.HasValue;
+            var hiddenAccountIds = applyBlockFilter
+                ? AccountBlockQueryHelper.CreateHiddenAccountIdsQuery(_context, currentId!.Value)
+                : _context.AccountBlocks
+                    .AsNoTracking()
+                    .Where(x => false)
+                    .Select(x => x.BlockedId);
+
+            var baseQuery = _context.Comments
+                .AsNoTracking()
+                .Where(c =>
+                    c.PostId == postId &&
+                    c.ParentCommentId == null &&
+                    c.Account.Status == AccountStatusEnum.Active &&
+                    SocialRoleRules.SocialEligibleRoleIds.Contains(c.Account.RoleId));
+
+            if (applyBlockFilter)
+            {
+                baseQuery = baseQuery.Where(c => !hiddenAccountIds.Contains(c.AccountId));
+            }
+
+            var totalItems = await baseQuery.CountAsync();
 
             var postOwnerId = await _context.Posts
                 .Where(p => p.PostId == postId)
                 .Select(p => p.AccountId)
                 .FirstOrDefaultAsync();
 
-            var items = await _context.Comments
-                .Where(c => c.PostId == postId && c.ParentCommentId == null && c.Account.Status == AccountStatusEnum.Active)
+            var effectivePriorityCommentId = priorityCommentId.HasValue && priorityCommentId.Value != Guid.Empty
+                ? priorityCommentId.Value
+                : Guid.Empty;
+            CommentWithReplyCountModel? priorityItem = null;
+            if (effectivePriorityCommentId != Guid.Empty && !cursorCreatedAt.HasValue && !cursorCommentId.HasValue)
+            {
+                priorityItem = await baseQuery
+                    .Where(c => c.CommentId == effectivePriorityCommentId)
+                    .Select(c => new CommentWithReplyCountModel
+                    {
+                        CommentId = c.CommentId,
+                        PostId = c.PostId,
+                        Owner = new AccountBasicInfoModel
+                        {
+                            AccountId = c.Account.AccountId,
+                            FullName = c.Account.FullName,
+                            Username = c.Account.Username,
+                            AvatarUrl = c.Account.AvatarUrl,
+                            Status = c.Account.Status
+                        },
+                        Content = c.Content,
+                        CreatedAt = c.CreatedAt,
+                        UpdatedAt = c.UpdatedAt,
+                        ReactCount = _context.CommentReacts.Count(r => r.CommentId == c.CommentId && r.Account.Status == AccountStatusEnum.Active && SocialRoleRules.SocialEligibleRoleIds.Contains(r.Account.RoleId)),
+                        ReplyCount = _context.Comments.Count(r =>
+                            r.ParentCommentId == c.CommentId &&
+                            r.Account.Status == AccountStatusEnum.Active &&
+                            SocialRoleRules.SocialEligibleRoleIds.Contains(r.Account.RoleId) &&
+                            (!applyBlockFilter || !hiddenAccountIds.Contains(r.AccountId))),
+                        IsCommentReactedByCurrentUser = currentId != null && _context.CommentReacts.Any(r => r.CommentId == c.CommentId && r.AccountId == currentId && r.Account.Status == AccountStatusEnum.Active && SocialRoleRules.SocialEligibleRoleIds.Contains(r.Account.RoleId)),
+                        PostOwnerId = postOwnerId
+                    })
+                    .FirstOrDefaultAsync();
+            }
+
+            var query = baseQuery;
+
+            if (priorityItem != null)
+            {
+                query = query.Where(c => c.CommentId != priorityItem.CommentId);
+            }
+            else if (effectivePriorityCommentId != Guid.Empty)
+            {
+                query = query.Where(c => c.CommentId != effectivePriorityCommentId);
+            }
+
+            if (cursorCreatedAt.HasValue && cursorCommentId.HasValue)
+            {
+                query = query.Where(c =>
+                    c.CreatedAt < cursorCreatedAt.Value
+                    || (c.CreatedAt == cursorCreatedAt.Value && c.CommentId.CompareTo(cursorCommentId.Value) < 0));
+            }
+
+            var rawItems = await query
                 .OrderByDescending(c => c.CreatedAt)
-                .Skip((page - 1) * pageSize)
-                .Take(pageSize)
+                .ThenByDescending(c => c.CommentId)
+                .Take(pageSize + 1)
                 .Select(c => new CommentWithReplyCountModel
                 {
                     CommentId = c.CommentId,
@@ -50,19 +123,46 @@ namespace CloudM.Infrastructure.Repositories.Comments
                     },
                     Content = c.Content,
                     CreatedAt = c.CreatedAt,
-                    ReactCount = _context.CommentReacts.Count(r => r.CommentId == c.CommentId && r.Account.Status == AccountStatusEnum.Active),
-                    ReplyCount = _context.Comments.Count(r => r.ParentCommentId == c.CommentId && r.Account.Status == AccountStatusEnum.Active),
-                    IsCommentReactedByCurrentUser = currentId != null && _context.CommentReacts.Any(r => r.CommentId == c.CommentId && r.AccountId == currentId && r.Account.Status == AccountStatusEnum.Active),
+                    ReactCount = _context.CommentReacts.Count(r => r.CommentId == c.CommentId && r.Account.Status == AccountStatusEnum.Active && SocialRoleRules.SocialEligibleRoleIds.Contains(r.Account.RoleId)),
+                    ReplyCount = _context.Comments.Count(r =>
+                        r.ParentCommentId == c.CommentId &&
+                        r.Account.Status == AccountStatusEnum.Active &&
+                        SocialRoleRules.SocialEligibleRoleIds.Contains(r.Account.RoleId) &&
+                        (!applyBlockFilter || !hiddenAccountIds.Contains(r.AccountId))),
+                    IsCommentReactedByCurrentUser = currentId != null && _context.CommentReacts.Any(r => r.CommentId == c.CommentId && r.AccountId == currentId && r.Account.Status == AccountStatusEnum.Active && SocialRoleRules.SocialEligibleRoleIds.Contains(r.Account.RoleId)),
                     PostOwnerId = postOwnerId
                 })
                 .ToListAsync();
 
-            return (items, totalItems);
+            var hasMore = rawItems.Count > pageSize;
+            var pagedItems = hasMore
+                ? rawItems.Take(pageSize).ToList()
+                : rawItems;
+
+            var items = priorityItem == null
+                ? pagedItems
+                : new[] { priorityItem }
+                    .Concat(pagedItems)
+                    .ToList();
+
+            DateTime? nextCursorCreatedAt = null;
+            Guid? nextCursorCommentId = null;
+            if (hasMore && pagedItems.Count > 0)
+            {
+                var last = pagedItems[^1];
+                nextCursorCreatedAt = last.CreatedAt;
+                nextCursorCommentId = last.CommentId;
+            }
+
+            return (items, totalItems, nextCursorCreatedAt, nextCursorCommentId);
         }
 
         public async Task<Comment?> GetCommentById(Guid commentId)
         {
-            return await _context.Comments.Include(c => c.Account).FirstOrDefaultAsync(c => c.CommentId == commentId && c.Account.Status == AccountStatusEnum.Active);
+            return await _context.Comments.Include(c => c.Account).FirstOrDefaultAsync(c =>
+                c.CommentId == commentId &&
+                c.Account.Status == AccountStatusEnum.Active &&
+                SocialRoleRules.SocialEligibleRoleIds.Contains(c.Account.RoleId));
         }
         public async Task AddComment(Comment comment)
         {
@@ -75,12 +175,31 @@ namespace CloudM.Infrastructure.Repositories.Comments
         }
         public async Task<bool> IsCommentExist(Guid commentId)
         {
-            return await _context.Comments.AnyAsync(c => c.CommentId == commentId && c.Account.Status == AccountStatusEnum.Active);
+            return await _context.Comments.AnyAsync(c =>
+                c.CommentId == commentId &&
+                c.Account.Status == AccountStatusEnum.Active &&
+                SocialRoleRules.SocialEligibleRoleIds.Contains(c.Account.RoleId));
         }
-        public async Task<int> CountCommentsByPostId(Guid postId)
+        public Task<int> CountCommentsByPostId(Guid postId)
         {
-            //comment (not reply)
-            return await _context.Comments.CountAsync(c => c.PostId == postId && c.ParentCommentId == null && c.Account.Status == AccountStatusEnum.Active);
+            return CountCommentsByPostId(postId, null);
+        }
+
+        public async Task<int> CountCommentsByPostId(Guid postId, Guid? currentId)
+        {
+            var query = _context.Comments.Where(c =>
+                c.PostId == postId &&
+                c.ParentCommentId == null &&
+                c.Account.Status == AccountStatusEnum.Active &&
+                SocialRoleRules.SocialEligibleRoleIds.Contains(c.Account.RoleId));
+
+            if (currentId.HasValue)
+            {
+                var hiddenAccountIds = AccountBlockQueryHelper.CreateHiddenAccountIdsQuery(_context, currentId.Value);
+                query = query.Where(c => !hiddenAccountIds.Contains(c.AccountId));
+            }
+
+            return await query.CountAsync();
         }
         public async Task DeleteCommentWithReplies(Guid commentId)
         {
@@ -105,32 +224,109 @@ namespace CloudM.Infrastructure.Repositories.Comments
 
         public async Task<bool> IsCommentCanReply(Guid commentId)
         {
-            return await _context.Comments.AnyAsync(c => c.CommentId == commentId && c.ParentCommentId == null && c.Account.Status == AccountStatusEnum.Active);
+            return await _context.Comments.AnyAsync(c =>
+                c.CommentId == commentId &&
+                c.ParentCommentId == null &&
+                c.Account.Status == AccountStatusEnum.Active &&
+                SocialRoleRules.SocialEligibleRoleIds.Contains(c.Account.RoleId));
         }
-        public async Task<int> CountCommentRepliesAsync(Guid commentId)
+        public Task<int> CountCommentRepliesAsync(Guid commentId)
         {
-            int count = 0;
-            count += await _context.Comments.Where(c => c.ParentCommentId == commentId && c.Account.Status == AccountStatusEnum.Active).CountAsync();
-            return count;
+            return CountCommentRepliesAsync(commentId, null);
         }
-        public async Task<(IEnumerable<ReplyCommentModel> items, int totalItems)> GetRepliesByCommentIdAsync(Guid parentCommentId, Guid? currentId, int page, int pageSize)
+
+        public async Task<int> CountCommentRepliesAsync(Guid commentId, Guid? currentId)
         {
-            if (page <= 0) page = 1;
+            var query = _context.Comments.Where(c =>
+                c.ParentCommentId == commentId &&
+                c.Account.Status == AccountStatusEnum.Active &&
+                SocialRoleRules.SocialEligibleRoleIds.Contains(c.Account.RoleId));
 
-            var query = _context.Comments
-                .Where(c => c.ParentCommentId == parentCommentId && c.Account.Status == AccountStatusEnum.Active);
+            if (currentId.HasValue)
+            {
+                var hiddenAccountIds = AccountBlockQueryHelper.CreateHiddenAccountIdsQuery(_context, currentId.Value);
+                query = query.Where(c => !hiddenAccountIds.Contains(c.AccountId));
+            }
 
-            var totalItems = await query.CountAsync();
+            return await query.CountAsync();
+        }
+        public async Task<(IEnumerable<ReplyCommentModel> items, int totalItems, DateTime? nextCursorCreatedAt, Guid? nextCursorCommentId)> GetRepliesByCommentIdAsync(Guid parentCommentId, Guid? currentId, DateTime? cursorCreatedAt, Guid? cursorCommentId, int pageSize, Guid? priorityReplyId = null)
+        {
+            if (pageSize <= 0) pageSize = 10;
+
+            var baseQuery = _context.Comments
+                .AsNoTracking()
+                .Where(c =>
+                    c.ParentCommentId == parentCommentId &&
+                    c.Account.Status == AccountStatusEnum.Active &&
+                    SocialRoleRules.SocialEligibleRoleIds.Contains(c.Account.RoleId));
+
+            if (currentId.HasValue)
+            {
+                var hiddenAccountIds = AccountBlockQueryHelper.CreateHiddenAccountIdsQuery(_context, currentId.Value);
+                baseQuery = baseQuery.Where(c => !hiddenAccountIds.Contains(c.AccountId));
+            }
+
+            var totalItems = await baseQuery.CountAsync();
+
+            var query = baseQuery;
+
+            if (cursorCreatedAt.HasValue && cursorCommentId.HasValue)
+            {
+                query = query.Where(c =>
+                    c.CreatedAt > cursorCreatedAt.Value
+                    || (c.CreatedAt == cursorCreatedAt.Value && c.CommentId.CompareTo(cursorCommentId.Value) > 0));
+            }
 
             var postOwnerId = await _context.Comments
                 .Where(c => c.CommentId == parentCommentId)
                 .Select(c => c.Post.AccountId)
                 .FirstOrDefaultAsync();
 
-            var items = await query
+            var effectivePriorityReplyId = priorityReplyId.HasValue && priorityReplyId.Value != Guid.Empty
+                ? priorityReplyId.Value
+                : Guid.Empty;
+            ReplyCommentModel? priorityItem = null;
+            if (effectivePriorityReplyId != Guid.Empty && !cursorCreatedAt.HasValue && !cursorCommentId.HasValue)
+            {
+                priorityItem = await baseQuery
+                    .Where(c => c.CommentId == effectivePriorityReplyId)
+                    .Select(c => new ReplyCommentModel
+                    {
+                        CommentId = c.CommentId,
+                        PostId = c.PostId,
+                        ParentCommentId = c.ParentCommentId!.Value,
+                        Owner = new AccountBasicInfoModel
+                        {
+                            AccountId = c.Account.AccountId,
+                            FullName = c.Account.FullName,
+                            Username = c.Account.Username,
+                            AvatarUrl = c.Account.AvatarUrl,
+                            Status = c.Account.Status
+                        },
+                        Content = c.Content,
+                        CreatedAt = c.CreatedAt,
+                        UpdatedAt = c.UpdatedAt,
+                        ReactCount = _context.CommentReacts.Count(r => r.CommentId == c.CommentId && r.Account.Status == AccountStatusEnum.Active && SocialRoleRules.SocialEligibleRoleIds.Contains(r.Account.RoleId)),
+                        IsCommentReactedByCurrentUser = currentId != null && _context.CommentReacts.Any(r => r.CommentId == c.CommentId && r.AccountId == currentId && r.Account.Status == AccountStatusEnum.Active && SocialRoleRules.SocialEligibleRoleIds.Contains(r.Account.RoleId)),
+                        PostOwnerId = postOwnerId
+                    })
+                    .FirstOrDefaultAsync();
+            }
+
+            if (priorityItem != null)
+            {
+                query = query.Where(c => c.CommentId != priorityItem.CommentId);
+            }
+            else if (effectivePriorityReplyId != Guid.Empty)
+            {
+                query = query.Where(c => c.CommentId != effectivePriorityReplyId);
+            }
+
+            var rawItems = await query
                 .OrderBy(c => c.CreatedAt) // Replies usually ordered ascending
-                .Skip((page - 1) * pageSize)
-                .Take(pageSize)
+                .ThenBy(c => c.CommentId)
+                .Take(pageSize + 1)
                 .Select(c => new ReplyCommentModel
                 {
                     CommentId = c.CommentId,
@@ -147,13 +343,33 @@ namespace CloudM.Infrastructure.Repositories.Comments
                     Content = c.Content,
                     CreatedAt = c.CreatedAt,
                     UpdatedAt = c.UpdatedAt,
-                    ReactCount = _context.CommentReacts.Count(r => r.CommentId == c.CommentId && r.Account.Status == AccountStatusEnum.Active),
-                    IsCommentReactedByCurrentUser = currentId != null && _context.CommentReacts.Any(r => r.CommentId == c.CommentId && r.AccountId == currentId && r.Account.Status == AccountStatusEnum.Active),
+                    ReactCount = _context.CommentReacts.Count(r => r.CommentId == c.CommentId && r.Account.Status == AccountStatusEnum.Active && SocialRoleRules.SocialEligibleRoleIds.Contains(r.Account.RoleId)),
+                    IsCommentReactedByCurrentUser = currentId != null && _context.CommentReacts.Any(r => r.CommentId == c.CommentId && r.AccountId == currentId && r.Account.Status == AccountStatusEnum.Active && SocialRoleRules.SocialEligibleRoleIds.Contains(r.Account.RoleId)),
                     PostOwnerId = postOwnerId
                 })
                 .ToListAsync();
 
-            return (items, totalItems);
+            var hasMore = rawItems.Count > pageSize;
+            var pagedItems = hasMore
+                ? rawItems.Take(pageSize).ToList()
+                : rawItems;
+
+            var items = priorityItem == null
+                ? pagedItems
+                : new[] { priorityItem }
+                    .Concat(pagedItems)
+                    .ToList();
+
+            DateTime? nextCursorCreatedAt = null;
+            Guid? nextCursorCommentId = null;
+            if (hasMore && pagedItems.Count > 0)
+            {
+                var last = pagedItems[^1];
+                nextCursorCreatedAt = last.CreatedAt;
+                nextCursorCommentId = last.CommentId;
+            }
+
+            return (items, totalItems, nextCursorCreatedAt, nextCursorCommentId);
         }
     }
 }

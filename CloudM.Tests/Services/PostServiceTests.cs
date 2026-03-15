@@ -4,6 +4,7 @@ using System.Threading.Tasks;
 using AutoMapper;
 using FluentAssertions;
 using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.Options;
 using Moq;
 using CloudM.Application.DTOs.PostDTOs;
 using CloudM.Application.Helpers.FileTypeHelpers;
@@ -15,6 +16,7 @@ using CloudM.Domain.Entities;
 using CloudM.Domain.Enums;
 using CloudM.Infrastructure.Models;
 using CloudM.Infrastructure.Repositories.Accounts;
+using CloudM.Infrastructure.Repositories.AccountBlocks;
 using CloudM.Infrastructure.Repositories.Comments;
 using CloudM.Infrastructure.Repositories.Follows;
 using CloudM.Infrastructure.Repositories.PostMedias;
@@ -29,6 +31,7 @@ namespace CloudM.Tests.Services
 {
     public class PostServiceTests
     {
+        private const string FeedCursorSigningKey = "post-service-test-signing-key";
         private readonly Mock<IPostRepository> _mockPostRepo;
         private readonly Mock<IPostMediaRepository> _mockPostMediaRepo;
         private readonly Mock<IPostReactRepository> _mockPostReactRepo;
@@ -42,6 +45,7 @@ namespace CloudM.Tests.Services
         private readonly Mock<IUnitOfWork> _mockUnitOfWork;
         private readonly Mock<IRealtimeService> _mockRealtimeService;
         private readonly Mock<IStoryViewService> _mockStoryViewService;
+        private readonly Mock<IAccountBlockRepository> _mockAccountBlockRepo;
         private readonly PostService _postService;
 
         public PostServiceTests()
@@ -59,6 +63,14 @@ namespace CloudM.Tests.Services
             _mockUnitOfWork = new Mock<IUnitOfWork>();
             _mockRealtimeService = new Mock<IRealtimeService>();
             _mockStoryViewService = new Mock<IStoryViewService>();
+            _mockAccountBlockRepo = new Mock<IAccountBlockRepository>();
+
+            _mockAccountBlockRepo
+                .Setup(x => x.GetRelationsAsync(
+                    It.IsAny<Guid>(),
+                    It.IsAny<IEnumerable<Guid>>(),
+                    It.IsAny<System.Threading.CancellationToken>()))
+                .ReturnsAsync(new List<AccountBlockRelationModel>());
 
             _postService = new PostService(
                 _mockPostReactRepo.Object,
@@ -73,7 +85,13 @@ namespace CloudM.Tests.Services
                 _mockMapper.Object,
                 _mockUnitOfWork.Object,
                 _mockRealtimeService.Object,
-                _mockStoryViewService.Object
+                _mockStoryViewService.Object,
+                null,
+                _mockAccountBlockRepo.Object,
+                Options.Create(new FeedRankingOptions
+                {
+                    CursorSigningKey = FeedCursorSigningKey
+                })
             );
         }
 
@@ -101,7 +119,7 @@ namespace CloudM.Tests.Services
             _mockPostRepo.Setup(x => x.GetPostById(postId)).ReturnsAsync(post);
             _mockMapper.Setup(x => x.Map<PostDetailResponse>(post)).Returns(expectedResponse);
             _mockPostReactRepo.Setup(x => x.GetReactCountByPostId(postId)).ReturnsAsync(5);
-            _mockCommentRepo.Setup(x => x.CountCommentsByPostId(postId)).ReturnsAsync(10);
+            _mockCommentRepo.Setup(x => x.CountCommentsByPostId(postId, currentId)).ReturnsAsync(10);
             _mockPostReactRepo.Setup(x => x.IsCurrentUserReactedOnPostAsync(postId, currentId)).ReturnsAsync(true);
 
             // Act
@@ -330,6 +348,208 @@ namespace CloudM.Tests.Services
         #region GetFeedByScoreAsync Tests
 
         [Fact]
+        public async Task GetFeedPageAsync_WithoutCursorToken_TrimsItemsAndCreatesNextCursor()
+        {
+            // Arrange
+            var currentId = Guid.NewGuid();
+            var authorA = Guid.NewGuid();
+            var authorB = Guid.NewGuid();
+            var authorC = Guid.NewGuid();
+            var feed = new List<PostFeedModel>
+            {
+                new PostFeedModel
+                {
+                    PostId = Guid.NewGuid(),
+                    CreatedAt = DateTime.UtcNow.AddMinutes(-10),
+                    RankingScore = 110m,
+                    RankingJitterRank = 5,
+                    Author = new AccountOnFeedModel
+                    {
+                        AccountId = authorA,
+                        Username = "author.a",
+                        FullName = "Author A",
+                        Status = AccountStatusEnum.Active
+                    }
+                },
+                new PostFeedModel
+                {
+                    PostId = Guid.NewGuid(),
+                    CreatedAt = DateTime.UtcNow.AddMinutes(-20),
+                    RankingScore = 108m,
+                    RankingJitterRank = 3,
+                    RankingWindowCursorCreatedAt = DateTime.UtcNow.AddDays(-2),
+                    RankingWindowCursorPostId = Guid.NewGuid(),
+                    Author = new AccountOnFeedModel
+                    {
+                        AccountId = authorB,
+                        Username = "author.b",
+                        FullName = "Author B",
+                        Status = AccountStatusEnum.Active
+                    }
+                },
+                new PostFeedModel
+                {
+                    PostId = Guid.NewGuid(),
+                    CreatedAt = DateTime.UtcNow.AddMinutes(-30),
+                    RankingScore = 95m,
+                    RankingJitterRank = 1,
+                    Author = new AccountOnFeedModel
+                    {
+                        AccountId = authorC,
+                        Username = "author.c",
+                        FullName = "Author C",
+                        Status = AccountStatusEnum.Active
+                    }
+                }
+            };
+
+            _mockPostRepo
+                .Setup(x => x.GetFeedPageAsync(
+                    currentId,
+                    It.Is<PostFeedCursorModel>(cursor =>
+                        !cursor.HasPosition &&
+                        cursor.ProfileKey == FeedRankingProfileModel.DefaultProfileKey &&
+                        cursor.SnapshotAt != default &&
+                        cursor.SessionSeed != 0),
+                    It.Is<FeedRankingProfileModel>(profile => profile.ProfileKey == FeedRankingProfileModel.DefaultProfileKey),
+                    3))
+                .ReturnsAsync(feed);
+
+            _mockStoryViewService
+                .Setup(x => x.GetStoryRingStatesForAuthorsAsync(currentId, It.IsAny<IEnumerable<Guid>>()))
+                .ReturnsAsync(new Dictionary<Guid, StoryRingStateEnum>
+                {
+                    { authorA, StoryRingStateEnum.Unseen },
+                    { authorB, StoryRingStateEnum.Seen }
+                });
+
+            // Act
+            var result = await _postService.GetFeedPageAsync(currentId, null, 2);
+
+            // Assert
+            result.Items.Should().HaveCount(2);
+            result.Items[0].Author.StoryRingState.Should().Be(StoryRingStateEnum.Unseen);
+            result.Items[1].Author.StoryRingState.Should().Be(StoryRingStateEnum.Seen);
+            result.NextCursor.Should().NotBeNull();
+            result.NextCursor!.Token.Should().NotBeNullOrWhiteSpace();
+            result.NextCursor.CreatedAt.Should().Be(feed[1].CreatedAt);
+            result.NextCursor.PostId.Should().Be(feed[1].PostId);
+
+            var decodedCursor = PostFeedCursorTokenSerializer.Deserialize(result.NextCursor.Token, FeedCursorSigningKey);
+            decodedCursor.ProfileKey.Should().Be(FeedRankingProfileModel.DefaultProfileKey);
+            decodedCursor.Score.Should().Be(feed[1].RankingScore);
+            decodedCursor.JitterRank.Should().Be(feed[1].RankingJitterRank);
+            decodedCursor.CreatedAt.Should().Be(feed[1].CreatedAt);
+            decodedCursor.PostId.Should().Be(feed[1].PostId);
+            decodedCursor.WindowCursorCreatedAt.Should().Be(feed[1].RankingWindowCursorCreatedAt);
+            decodedCursor.WindowCursorPostId.Should().Be(feed[1].RankingWindowCursorPostId);
+        }
+
+        [Fact]
+        public async Task GetFeedPageAsync_WithCursorToken_ReusesSnapshotSeedAndCursorPosition()
+        {
+            // Arrange
+            var currentId = Guid.NewGuid();
+            var authorId = Guid.NewGuid();
+            var cursorModel = new PostFeedCursorModel
+            {
+                SnapshotAt = new DateTime(2026, 3, 11, 10, 30, 0, DateTimeKind.Utc),
+                ProfileKey = FeedRankingProfileModel.DefaultProfileKey,
+                SessionSeed = 99,
+                Score = 42m,
+                JitterRank = 4,
+                CreatedAt = new DateTime(2026, 3, 10, 8, 0, 0, DateTimeKind.Utc),
+                PostId = Guid.NewGuid(),
+                WindowCursorCreatedAt = new DateTime(2026, 3, 1, 0, 0, 0, DateTimeKind.Utc),
+                WindowCursorPostId = Guid.NewGuid()
+            };
+            var cursorToken = PostFeedCursorTokenSerializer.Serialize(cursorModel, FeedCursorSigningKey);
+            var feed = new List<PostFeedModel>
+            {
+                new PostFeedModel
+                {
+                    PostId = Guid.NewGuid(),
+                    CreatedAt = DateTime.UtcNow.AddMinutes(-15),
+                    RankingScore = 41m,
+                    RankingJitterRank = 2,
+                    Author = new AccountOnFeedModel
+                    {
+                        AccountId = authorId,
+                        Username = "author.cursor",
+                        FullName = "Author Cursor",
+                        Status = AccountStatusEnum.Active
+                    }
+                }
+            };
+
+            _mockPostRepo
+                .Setup(x => x.GetFeedPageAsync(
+                    currentId,
+                    It.Is<PostFeedCursorModel>(cursor =>
+                        cursor.SnapshotAt == cursorModel.SnapshotAt &&
+                        cursor.ProfileKey == cursorModel.ProfileKey &&
+                        cursor.SessionSeed == cursorModel.SessionSeed &&
+                        cursor.Score == cursorModel.Score &&
+                        cursor.JitterRank == cursorModel.JitterRank &&
+                        cursor.CreatedAt == cursorModel.CreatedAt &&
+                        cursor.PostId == cursorModel.PostId &&
+                        cursor.WindowCursorCreatedAt == cursorModel.WindowCursorCreatedAt &&
+                        cursor.WindowCursorPostId == cursorModel.WindowCursorPostId),
+                    It.Is<FeedRankingProfileModel>(profile => profile.ProfileKey == cursorModel.ProfileKey),
+                    11))
+                .ReturnsAsync(feed);
+
+            _mockStoryViewService
+                .Setup(x => x.GetStoryRingStatesForAuthorsAsync(currentId, It.IsAny<IEnumerable<Guid>>()))
+                .ReturnsAsync(new Dictionary<Guid, StoryRingStateEnum>
+                {
+                    { authorId, StoryRingStateEnum.Seen }
+                });
+
+            // Act
+            var result = await _postService.GetFeedPageAsync(currentId, cursorToken, 10);
+
+            // Assert
+            result.Items.Should().HaveCount(1);
+            result.Items[0].Author.StoryRingState.Should().Be(StoryRingStateEnum.Seen);
+            result.NextCursor.Should().BeNull();
+        }
+
+        [Fact]
+        public async Task GetFeedPageAsync_WithInvalidCursorToken_ThrowsBadRequestException()
+        {
+            // Act
+            var act = () => _postService.GetFeedPageAsync(Guid.NewGuid(), "invalid-token", 10);
+
+            // Assert
+            await act.Should().ThrowAsync<BadRequestException>();
+        }
+
+        [Fact]
+        public async Task GetFeedPageAsync_WithTamperedCursorToken_ThrowsBadRequestException()
+        {
+            // Arrange
+            var cursorModel = new PostFeedCursorModel
+            {
+                SnapshotAt = new DateTime(2026, 3, 11, 10, 30, 0, DateTimeKind.Utc),
+                ProfileKey = FeedRankingProfileModel.DefaultProfileKey,
+                SessionSeed = 99,
+                Score = 42m,
+                JitterRank = 4,
+                CreatedAt = new DateTime(2026, 3, 10, 8, 0, 0, DateTimeKind.Utc),
+                PostId = Guid.NewGuid()
+            };
+            var validToken = PostFeedCursorTokenSerializer.Serialize(cursorModel, FeedCursorSigningKey);
+            var tamperedToken = $"{validToken}tamper";
+
+            // Act
+            var act = () => _postService.GetFeedPageAsync(Guid.NewGuid(), tamperedToken, 10);
+
+            // Assert
+            await act.Should().ThrowAsync<BadRequestException>();
+        }
+
+        [Fact]
         public async Task GetFeedByScoreAsync_WithValidLimit_ReturnsFeed()
         {
             // Arrange
@@ -514,6 +734,59 @@ namespace CloudM.Tests.Services
                 .ReturnsAsync(new List<Account> { taggedAccount });
             _mockFollowRepo.Setup(x => x.GetFollowerIdsInTargetsAsync(currentId, It.IsAny<IEnumerable<Guid>>()))
                 .ReturnsAsync(new HashSet<Guid>());
+
+            // Act & Assert
+            await Assert.ThrowsAsync<BadRequestException>(() => _postService.CreatePost(currentId, request));
+            _mockPostRepo.Verify(x => x.AddPost(It.IsAny<Post>()), Times.Never);
+            _mockUnitOfWork.Verify(x => x.CommitAsync(), Times.Never);
+        }
+
+        [Fact]
+        public async Task CreatePost_WhenTaggedAccountIsBlocked_ThrowsBadRequestException()
+        {
+            // Arrange
+            var currentId = Guid.NewGuid();
+            var taggedId = Guid.NewGuid();
+            var currentAccount = new Account
+            {
+                AccountId = currentId,
+                Status = AccountStatusEnum.Active
+            };
+
+            var taggedAccount = new Account
+            {
+                AccountId = taggedId,
+                Status = AccountStatusEnum.Active,
+                Settings = new AccountSettings
+                {
+                    AccountId = taggedId,
+                    TagPermission = TagPermissionEnum.Anyone
+                }
+            };
+
+            var request = new PostCreateRequest
+            {
+                Privacy = (int)PostPrivacyEnum.Public,
+                TaggedAccountIds = new List<Guid> { taggedId },
+                MediaFiles = new List<IFormFile>()
+            };
+
+            _mockAccountRepo.Setup(x => x.GetAccountById(currentId)).ReturnsAsync(currentAccount);
+            _mockAccountRepo.Setup(x => x.GetAccountsByIds(It.IsAny<IEnumerable<Guid>>()))
+                .ReturnsAsync(new List<Account> { taggedAccount });
+            _mockAccountBlockRepo
+                .Setup(x => x.GetRelationsAsync(
+                    currentId,
+                    It.IsAny<IEnumerable<Guid>>(),
+                    It.IsAny<System.Threading.CancellationToken>()))
+                .ReturnsAsync(new List<AccountBlockRelationModel>
+                {
+                    new()
+                    {
+                        TargetId = taggedId,
+                        IsBlockedByCurrentUser = true
+                    }
+                });
 
             // Act & Assert
             await Assert.ThrowsAsync<BadRequestException>(() => _postService.CreatePost(currentId, request));

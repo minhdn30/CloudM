@@ -1,7 +1,9 @@
 using Microsoft.EntityFrameworkCore;
 using CloudM.Domain.Entities;
 using CloudM.Domain.Enums;
+using CloudM.Domain.Helpers;
 using CloudM.Infrastructure.Data;
+using CloudM.Infrastructure.Helpers;
 using CloudM.Infrastructure.Models;
 
 namespace CloudM.Infrastructure.Repositories.Stories
@@ -329,6 +331,7 @@ namespace CloudM.Infrastructure.Repositories.Stories
                 .AsNoTracking()
                 .Where(f => f.FollowerId == currentId)
                 .Select(f => f.FollowedId);
+            var hiddenAccountIds = AccountBlockQueryHelper.CreateHiddenAccountIdsQuery(_context, currentId);
 
             return _context.Stories
                 .AsNoTracking()
@@ -336,6 +339,8 @@ namespace CloudM.Infrastructure.Repositories.Stories
                     !s.IsDeleted &&
                     s.ExpiresAt > nowUtc &&
                     s.Account.Status == AccountStatusEnum.Active &&
+                    !hiddenAccountIds.Contains(s.AccountId) &&
+                    SocialRoleRules.SocialEligibleRoleIds.Contains(s.Account.RoleId) &&
                     (
                         s.AccountId == currentId ||
                         (

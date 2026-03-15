@@ -4,12 +4,14 @@ using CloudM.Application.DTOs.AuthDTOs;
 using CloudM.Application.Services.JwtServices;
 using CloudM.Domain.Entities;
 using CloudM.Domain.Enums;
+using CloudM.Domain.Helpers;
 using CloudM.Infrastructure.Repositories.Accounts;
 using CloudM.Infrastructure.Repositories.AccountSettingRepos;
 using CloudM.Infrastructure.Repositories.ExternalLogins;
 using CloudM.Infrastructure.Repositories.UnitOfWork;
 using System.Net;
 using System.Security.Cryptography;
+using System.Text.RegularExpressions;
 using static CloudM.Domain.Exceptions.CustomExceptions;
 using LoginRequest = CloudM.Application.DTOs.AuthDTOs.LoginRequest;
 
@@ -17,8 +19,10 @@ namespace CloudM.Application.Services.AuthServices
 {
     public class AuthService : IAuthService
     {
+        private const int PasswordMinLength = 6;
         private const int MaxFullNameLength = 100;
         private const int ExternalProfileFullNameMaxLength = 25;
+        private static readonly Regex PasswordAccentRegex = new(@"[\u00C0-\u024F\u1E00-\u1EFF]", RegexOptions.Compiled);
 
         private readonly IAccountRepository _accountRepository;
         private readonly IExternalLoginRepository _externalLoginRepository;
@@ -359,6 +363,57 @@ namespace CloudM.Application.Services.AuthServices
                 .ToList();
         }
 
+        public async Task<PasswordStatusResponse> GetPasswordStatusAsync(Guid accountId)
+        {
+            var account = await _accountRepository.GetAccountById(accountId);
+            if (account == null)
+            {
+                throw new NotFoundException("Account not found.");
+            }
+
+            var externalLogins = await GetExternalLoginsAsync(accountId);
+            return new PasswordStatusResponse
+            {
+                HasPassword = HasPassword(account),
+                ExternalLogins = externalLogins
+            };
+        }
+
+        public async Task<LoginResponse> ChangePasswordAsync(Guid accountId, string currentPassword, string newPassword, string confirmPassword)
+        {
+            ValidatePasswordInputOrThrow(newPassword, confirmPassword);
+
+            var account = await _accountRepository.GetAccountById(accountId);
+            if (account == null)
+            {
+                throw new NotFoundException("Account not found.");
+            }
+
+            if (HasPassword(account))
+            {
+                if (string.IsNullOrWhiteSpace(currentPassword))
+                {
+                    throw new BadRequestException("Current password is required.");
+                }
+
+                var isCurrentPasswordValid = BCrypt.Net.BCrypt.Verify(currentPassword, account.PasswordHash);
+                if (!isCurrentPasswordValid)
+                {
+                    throw new BadRequestException("Current password is incorrect.");
+                }
+            }
+
+            var nowUtc = DateTime.UtcNow;
+            account.PasswordHash = BCrypt.Net.BCrypt.HashPassword(newPassword);
+            account.RefreshToken = GenerateRefreshToken();
+            account.RefreshTokenExpiryTime = nowUtc.AddDays(7);
+            account.UpdatedAt = nowUtc;
+
+            await _accountRepository.UpdateAccount(account);
+            await _unitOfWork.CommitAsync();
+            return await BuildLoginResponseAsync(account);
+        }
+
         public async Task UnlinkExternalLoginAsync(Guid accountId, ExternalLoginProviderEnum provider)
         {
             var account = await _accountRepository.GetAccountById(accountId);
@@ -406,10 +461,7 @@ namespace CloudM.Application.Services.AuthServices
                 throw new UnauthorizedException("Invalid or expired refresh token.");
             }
 
-            if (account.Status == AccountStatusEnum.Banned || account.Status == AccountStatusEnum.Suspended || account.Status == AccountStatusEnum.Deleted)
-            {
-                throw new UnauthorizedException("Your account has been restricted.");
-            }
+            ThrowRestrictedAccountExceptionIfNeeded(account);
 
             if (account.Status == AccountStatusEnum.EmailNotVerified)
             {
@@ -440,6 +492,7 @@ namespace CloudM.Application.Services.AuthServices
                 Fullname = account.FullName,
                 AvatarUrl = account.AvatarUrl,
                 Status = account.Status,
+                IsSocialEligible = SocialRoleRules.IsSocialEligibleRole(account.RoleId),
                 DefaultPostPrivacy = defaultPostPrivacy
             };
         }
@@ -605,10 +658,7 @@ namespace CloudM.Application.Services.AuthServices
 
         private static void EnsureAccountAllowedForExternalLink(Account account)
         {
-            if (account.Status == AccountStatusEnum.Banned || account.Status == AccountStatusEnum.Suspended || account.Status == AccountStatusEnum.Deleted)
-            {
-                throw new UnauthorizedException("Your account has been restricted. Please contact support.");
-            }
+            ThrowRestrictedAccountExceptionIfNeeded(account);
         }
 
         private static void EnsureAccountCanLoginWithExternal(Account account)
@@ -623,14 +673,29 @@ namespace CloudM.Application.Services.AuthServices
 
         private static void EnsureAccountCanLoginWithPassword(Account account)
         {
-            if (account.Status == AccountStatusEnum.Banned || account.Status == AccountStatusEnum.Suspended || account.Status == AccountStatusEnum.Deleted)
-            {
-                throw new UnauthorizedException("Your account has been restricted. Please contact support.");
-            }
+            ThrowRestrictedAccountExceptionIfNeeded(account);
 
             if (account.Status == AccountStatusEnum.EmailNotVerified)
             {
                 throw new UnauthorizedException("Email is not verified. Please verify your email.");
+            }
+        }
+
+        private static void ThrowRestrictedAccountExceptionIfNeeded(Account account)
+        {
+            if (account.Status == AccountStatusEnum.Suspended)
+            {
+                throw new UnauthorizedException("Your account has been suspended. Please contact support.");
+            }
+
+            if (account.Status == AccountStatusEnum.Banned)
+            {
+                throw new UnauthorizedException("Your account has been banned. Please contact support.");
+            }
+
+            if (account.Status == AccountStatusEnum.Deleted)
+            {
+                throw new UnauthorizedException("Your account has been restricted. Please contact support.");
             }
         }
 
@@ -662,8 +727,37 @@ namespace CloudM.Application.Services.AuthServices
                 RefreshToken = account.RefreshToken,
                 RefreshTokenExpiryTime = account.RefreshTokenExpiryTime ?? DateTime.UtcNow.AddDays(7),
                 Status = account.Status,
+                IsSocialEligible = SocialRoleRules.IsSocialEligibleRole(account.RoleId),
                 DefaultPostPrivacy = defaultPostPrivacy
             };
+        }
+
+        private static void ValidatePasswordInputOrThrow(string newPassword, string confirmPassword)
+        {
+            if (string.IsNullOrWhiteSpace(newPassword))
+            {
+                throw new BadRequestException("New password is required.");
+            }
+
+            if (newPassword.Length < PasswordMinLength)
+            {
+                throw new BadRequestException($"Password must be at least {PasswordMinLength} characters long.");
+            }
+
+            if (newPassword.Contains(' '))
+            {
+                throw new BadRequestException("Password cannot contain spaces.");
+            }
+
+            if (PasswordAccentRegex.IsMatch(newPassword))
+            {
+                throw new BadRequestException("Password cannot contain Vietnamese accents.");
+            }
+
+            if (!string.Equals(newPassword, confirmPassword, StringComparison.Ordinal))
+            {
+                throw new BadRequestException("Password and Confirm Password do not match.");
+            }
         }
 
         private static string NormalizeUsername(string username)

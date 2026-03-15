@@ -1,6 +1,7 @@
 ﻿using AutoMapper;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Options;
 using CloudM.Application.DTOs.AccountDTOs;
 using CloudM.Application.DTOs.CommonDTOs;
 using CloudM.Application.DTOs.PostDTOs;
@@ -9,6 +10,8 @@ using CloudM.Domain.Exceptions;
 using CloudM.Application.Helpers.FileTypeHelpers;
 using CloudM.Application.Helpers.StoryHelpers;
 using CloudM.Application.Helpers.SwaggerHelpers;
+using CloudM.Application.Helpers.CloudinaryHelpers;
+using CloudM.Domain.Helpers;
 using CloudM.Infrastructure.Services.Cloudinary;
 using CloudM.Application.Services.NotificationServices;
 using CloudM.Application.Services.RealtimeServices;
@@ -17,6 +20,7 @@ using CloudM.Domain.Entities;
 using CloudM.Domain.Enums;
 using CloudM.Infrastructure.Models;
 using CloudM.Infrastructure.Repositories.Accounts;
+using CloudM.Infrastructure.Repositories.AccountBlocks;
 using CloudM.Infrastructure.Repositories.Comments;
 using CloudM.Infrastructure.Repositories.Follows;
 using CloudM.Infrastructure.Repositories.PostMedias;
@@ -24,6 +28,7 @@ using CloudM.Infrastructure.Repositories.PostReacts;
 using CloudM.Infrastructure.Repositories.PostSaves;
 using CloudM.Infrastructure.Repositories.Posts;
 using CloudM.Infrastructure.Repositories.UnitOfWork;
+using System.Security.Cryptography;
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -53,6 +58,8 @@ namespace CloudM.Application.Services.PostServices
         private readonly INotificationService _notificationService;
         private readonly IRealtimeService _realtimeService;
         private readonly IStoryRingStateHelper _storyRingStateHelper;
+        private readonly IAccountBlockRepository _accountBlockRepository;
+        private readonly FeedRankingOptions _feedRankingOptions;
         public PostService(IPostReactRepository postReactRepository,
                            IPostSaveRepository postSaveRepository,
                            IPostMediaRepository postMediaRepository,
@@ -67,7 +74,9 @@ namespace CloudM.Application.Services.PostServices
                            INotificationService notificationService,
                            IRealtimeService realtimeService,
                            IStoryViewService storyViewService,
-                           IStoryRingStateHelper? storyRingStateHelper = null)
+                           IStoryRingStateHelper? storyRingStateHelper = null,
+                           IAccountBlockRepository? accountBlockRepository = null,
+                           IOptions<FeedRankingOptions>? feedRankingOptions = null)
         {
             _postRepository = postRepository;
             _postMediaRepository = postMediaRepository;
@@ -83,6 +92,8 @@ namespace CloudM.Application.Services.PostServices
             _notificationService = notificationService;
             _realtimeService = realtimeService;
             _storyRingStateHelper = storyRingStateHelper ?? new StoryRingStateHelper(storyViewService);
+            _accountBlockRepository = accountBlockRepository ?? NullAccountBlockRepository.Instance;
+            _feedRankingOptions = (feedRankingOptions?.Value ?? new FeedRankingOptions()).Normalize();
         }
 
         public PostService(IPostReactRepository postReactRepository,
@@ -98,7 +109,9 @@ namespace CloudM.Application.Services.PostServices
                            IUnitOfWork unitOfWork,
                            IRealtimeService realtimeService,
                            IStoryViewService storyViewService,
-                           IStoryRingStateHelper? storyRingStateHelper = null)
+                           IStoryRingStateHelper? storyRingStateHelper = null,
+                           IAccountBlockRepository? accountBlockRepository = null,
+                           IOptions<FeedRankingOptions>? feedRankingOptions = null)
             : this(
                 postReactRepository,
                 postSaveRepository,
@@ -114,7 +127,9 @@ namespace CloudM.Application.Services.PostServices
                 NullNotificationService.Instance,
                 realtimeService,
                 storyViewService,
-                storyRingStateHelper)
+                storyRingStateHelper,
+                accountBlockRepository,
+                feedRankingOptions)
         {
         }
 
@@ -127,7 +142,7 @@ namespace CloudM.Application.Services.PostServices
             }
             var result = _mapper.Map<PostDetailResponse>(post);
             result.TotalReacts = await _postReactRepository.GetReactCountByPostId(postId);
-            result.TotalComments = await _commentRepository.CountCommentsByPostId(postId);
+            result.TotalComments = await _commentRepository.CountCommentsByPostId(postId, currentId);
             result.IsReactedByCurrentUser = await _postReactRepository.IsCurrentUserReactedOnPostAsync(postId, currentId);
             result.IsSavedByCurrentUser = currentId.HasValue && await _postSaveRepository.IsPostSavedByCurrentAsync(currentId.Value, postId);
             return result;
@@ -186,7 +201,7 @@ namespace CloudM.Application.Services.PostServices
             if (account == null)
                 throw new BadRequestException($"Account with ID {accountId} not found.");
 
-            if (account.Status != AccountStatusEnum.Active)
+            if (!SocialRoleRules.IsSocialEligible(account))
                 throw new ForbiddenException("You must reactivate your account to create posts.");
 
             var normalizedTagIds = NormalizePostTagIds(request.TaggedAccountIds, accountId);
@@ -198,7 +213,7 @@ namespace CloudM.Application.Services.PostServices
             var effectiveCreatePrivacy = request.Privacy.HasValue
                 ? (PostPrivacyEnum)request.Privacy.Value
                 : PostPrivacyEnum.Public;
-            var validatedTaggedAccounts = await ValidateTaggedAccountsAsync(normalizedTagIds);
+            var validatedTaggedAccounts = await ValidateTaggedAccountsAsync(accountId, normalizedTagIds);
             await EnsureTaggedAccountsCompatibleWithPrivacyAsync(
                 accountId,
                 effectiveCreatePrivacy,
@@ -216,6 +231,7 @@ namespace CloudM.Application.Services.PostServices
 
             if (request.MediaFiles != null && request.MediaFiles.Any())
             {
+                var cleanupPlan = new CloudinaryCleanupPlan(_cloudinaryService);
                 // First, validate all file types synchronously (fast operation)
                 var mediaWithTypes = new List<(Microsoft.AspNetCore.Http.IFormFile File, MediaTypeEnum Type, int Index)>();
                 for (int i = 0; i < request.MediaFiles.Count; i++)
@@ -233,23 +249,33 @@ namespace CloudM.Application.Services.PostServices
                 var uploadTasks = mediaWithTypes.Select(async item =>
                 {
                     var url = await _cloudinaryService.UploadImageAsync(item.File);
+                    cleanupPlan.AddRollbackDeleteByUrl(url, MediaTypeEnum.Image);
                     return (Url: url, Type: item.Type, Index: item.Index);
                 });
 
-                var results = await Task.WhenAll(uploadTasks);
-
-                // Validate all uploads succeeded
-                foreach (var result in results)
+                (string? Url, MediaTypeEnum Type, int Index)[] results;
+                try
                 {
-                    if (string.IsNullOrEmpty(result.Url))
-                    {
-                        throw new BadRequestException($"Failed to upload image at position {result.Index + 1}.");
-                    }
-                    validResults.Add((result.Url!, result.Type, result.Index));
-                }
+                    results = await Task.WhenAll(uploadTasks);
 
-                if (validResults.Count != request.MediaFiles.Count)
-                    throw new BadRequestException("Some images failed to upload or are invalid. Videos are not supported.");
+                    // Validate all uploads succeeded
+                    foreach (var result in results)
+                    {
+                        if (string.IsNullOrEmpty(result.Url))
+                        {
+                            throw new BadRequestException($"Failed to upload image at position {result.Index + 1}.");
+                        }
+                        validResults.Add((result.Url!, result.Type, result.Index));
+                    }
+
+                    if (validResults.Count != request.MediaFiles.Count)
+                        throw new BadRequestException("Some images failed to upload or are invalid. Videos are not supported.");
+                }
+                catch
+                {
+                    await cleanupPlan.ExecuteRollbackAsync();
+                    throw;
+                }
 
                 // Map to domain entities (ordered by original index)
                 var now = DateTime.UtcNow;
@@ -330,15 +356,7 @@ namespace CloudM.Application.Services.PostServices
                         return result;
                     },
                     // Cleanup callback: delete orphaned images from Cloudinary if DB fail
-                    async () =>
-                    {
-                        var cleanupTasks = uploadedUrls.Select(url =>
-                        {
-                            var pid = _cloudinaryService.GetPublicIdFromUrl(url);
-                            return !string.IsNullOrEmpty(pid) ? _cloudinaryService.DeleteMediaAsync(pid, MediaTypeEnum.Image) : Task.CompletedTask;
-                        });
-                        await Task.WhenAll(cleanupTasks);
-                    }
+                    cleanupPlan.ExecuteRollbackAsync
                 );
             }
 
@@ -389,7 +407,7 @@ namespace CloudM.Application.Services.PostServices
             var account = await _accountRepository.GetAccountById(post.AccountId);
             var result = _mapper.Map<PostDetailResponse>(post);
             result.TotalReacts = await _postReactRepository.GetReactCountByPostId(postId);
-            result.TotalComments = await _commentRepository.CountCommentsByPostId(postId);
+            result.TotalComments = await _commentRepository.CountCommentsByPostId(postId, currentId);
             result.IsReactedByCurrentUser = await _postReactRepository.IsCurrentUserReactedOnPostAsync(postId, currentId);
             result.IsSavedByCurrentUser = await _postSaveRepository.IsPostSavedByCurrentAsync(currentId, postId);
 
@@ -479,7 +497,7 @@ namespace CloudM.Application.Services.PostServices
 
                 if (addTagIds.Count > 0)
                 {
-                    var validatedAddedAccounts = await ValidateTaggedAccountsAsync(addTagIds);
+                    var validatedAddedAccounts = await ValidateTaggedAccountsAsync(currentId, addTagIds);
                     await EnsureTaggedAccountsCompatibleWithPrivacyAsync(
                         post.AccountId,
                         effectivePrivacy,
@@ -626,8 +644,7 @@ namespace CloudM.Application.Services.PostServices
         }
         public async Task<List<PostFeedModel>> GetFeedByScoreAsync(Guid currentId, DateTime? cursorCreatedAt, Guid? cursorPostId, int limit)
         {
-            if (limit <= 0) limit = 10;
-            if (limit > 50) limit = 50;
+            limit = NormalizeFeedLimit(limit);
 
             var feed = await _postRepository.GetFeedByScoreAsync(
                 currentId,
@@ -635,27 +652,83 @@ namespace CloudM.Application.Services.PostServices
                 cursorPostId,
                 limit);
 
-            if (feed.Count == 0)
-            {
-                return feed;
-            }
-
-            var authorIds = feed
-                .Select(x => x.Author.AccountId)
-                .Where(id => id != Guid.Empty)
-                .Distinct()
-                .ToList();
-
-            var storyRingStateMap = await _storyRingStateHelper.ResolveManyAsync(currentId, authorIds);
-
-            foreach (var post in feed)
-            {
-                post.Author.StoryRingState = storyRingStateMap.TryGetValue(post.Author.AccountId, out var ringState)
-                    ? ringState
-                    : StoryRingStateEnum.None;
-            }
-
+            await ApplyFeedStoryRingStateAsync(currentId, feed);
             return feed;
+        }
+
+        public async Task<PostFeedCursorResponse> GetFeedPageAsync(Guid currentId, string? cursorToken, int limit)
+        {
+            limit = NormalizeFeedLimit(limit);
+
+            FeedRankingProfileModel rankingProfile;
+            PostFeedCursorModel? requestCursor = null;
+
+            if (!string.IsNullOrWhiteSpace(cursorToken))
+            {
+                requestCursor = PostFeedCursorTokenSerializer.Deserialize(cursorToken, _feedRankingOptions.CursorSigningKey);
+                if (!_feedRankingOptions.TryResolveProfile(requestCursor.ProfileKey, out rankingProfile))
+                {
+                    throw new BadRequestException("Invalid feed cursor.");
+                }
+            }
+            else
+            {
+                rankingProfile = _feedRankingOptions.ResolveActiveProfile();
+            }
+
+            var activeCursor = requestCursor ?? new PostFeedCursorModel
+            {
+                SnapshotAt = DateTime.UtcNow,
+                ProfileKey = rankingProfile.ProfileKey,
+                SessionSeed = RandomNumberGenerator.GetInt32(1, int.MaxValue)
+            };
+
+            if (requestCursor != null)
+            {
+                activeCursor.ProfileKey = rankingProfile.ProfileKey;
+            }
+
+            var candidates = await _postRepository.GetFeedPageAsync(
+                currentId,
+                activeCursor,
+                rankingProfile,
+                limit + 1);
+
+            var hasMore = candidates.Count > limit;
+            var items = hasMore ? candidates.Take(limit).ToList() : candidates;
+
+            await ApplyFeedStoryRingStateAsync(currentId, items);
+
+            PostFeedNextCursorResponse? nextCursor = null;
+            if (hasMore && items.Count > 0)
+            {
+                var lastItem = items.Last();
+                var nextCursorModel = new PostFeedCursorModel
+                {
+                    SnapshotAt = activeCursor.SnapshotAt,
+                    ProfileKey = rankingProfile.ProfileKey,
+                    SessionSeed = activeCursor.SessionSeed,
+                    Score = lastItem.RankingScore,
+                    JitterRank = lastItem.RankingJitterRank,
+                    CreatedAt = lastItem.CreatedAt,
+                    PostId = lastItem.PostId,
+                    WindowCursorCreatedAt = lastItem.RankingWindowCursorCreatedAt,
+                    WindowCursorPostId = lastItem.RankingWindowCursorPostId
+                };
+
+                nextCursor = new PostFeedNextCursorResponse
+                {
+                    Token = PostFeedCursorTokenSerializer.Serialize(nextCursorModel, _feedRankingOptions.CursorSigningKey),
+                    CreatedAt = lastItem.CreatedAt,
+                    PostId = lastItem.PostId
+                };
+            }
+
+            return new PostFeedCursorResponse
+            {
+                Items = items,
+                NextCursor = nextCursor
+            };
         }
 
         private async Task ApplyStoryRingStateForOwnerAsync(Guid currentId, AccountBasicInfoModel? owner)
@@ -668,6 +741,44 @@ namespace CloudM.Application.Services.PostServices
             owner.StoryRingState = await _storyRingStateHelper.ResolveAsync(currentId, owner.AccountId);
         }
 
+        private static int NormalizeFeedLimit(int limit)
+        {
+            if (limit <= 0)
+            {
+                return 10;
+            }
+
+            return limit > 50 ? 50 : limit;
+        }
+
+        private async Task ApplyFeedStoryRingStateAsync(Guid currentId, List<PostFeedModel> feed)
+        {
+            if (feed.Count == 0)
+            {
+                return;
+            }
+
+            var authorIds = feed
+                .Select(x => x.Author.AccountId)
+                .Where(id => id != Guid.Empty)
+                .Distinct()
+                .ToList();
+
+            if (authorIds.Count == 0)
+            {
+                return;
+            }
+
+            var storyRingStateMap = await _storyRingStateHelper.ResolveManyAsync(currentId, authorIds);
+
+            foreach (var post in feed)
+            {
+                post.Author.StoryRingState = storyRingStateMap.TryGetValue(post.Author.AccountId, out var ringState)
+                    ? ringState
+                    : StoryRingStateEnum.None;
+            }
+        }
+
         private static List<Guid> NormalizePostTagIds(IEnumerable<Guid>? tagIds, Guid currentId)
         {
             return (tagIds ?? Enumerable.Empty<Guid>())
@@ -676,7 +787,7 @@ namespace CloudM.Application.Services.PostServices
                 .ToList();
         }
 
-        private async Task<List<Account>> ValidateTaggedAccountsAsync(List<Guid> taggedAccountIds)
+        private async Task<List<Account>> ValidateTaggedAccountsAsync(Guid currentId, List<Guid> taggedAccountIds)
         {
             if (taggedAccountIds.Count == 0)
             {
@@ -692,6 +803,12 @@ namespace CloudM.Application.Services.PostServices
                 .Where(x => !activeAccountMap.ContainsKey(x))
                 .ToList();
             if (notFoundOrInactiveIds.Count > 0)
+            {
+                throw new BadRequestException("Some selected accounts are unavailable for tagging.");
+            }
+
+            var blockedTargets = await _accountBlockRepository.GetRelationsAsync(currentId, taggedAccountIds);
+            if (blockedTargets.Any(x => x.IsBlockedEitherWay))
             {
                 throw new BadRequestException("Some selected accounts are unavailable for tagging.");
             }
@@ -895,6 +1012,18 @@ namespace CloudM.Application.Services.PostServices
                 occurredAt);
             await _notificationService.EnqueueTargetUnavailableForExistingRecipientsAsync(
                 NotificationTypeEnum.PostReact,
+                NotificationTargetKindEnum.Post,
+                postId,
+                initiatorId,
+                occurredAt);
+            await _notificationService.EnqueueTargetUnavailableForExistingRecipientsAsync(
+                NotificationTypeEnum.CommentReact,
+                NotificationTargetKindEnum.Post,
+                postId,
+                initiatorId,
+                occurredAt);
+            await _notificationService.EnqueueTargetUnavailableForExistingRecipientsAsync(
+                NotificationTypeEnum.ReplyReact,
                 NotificationTargetKindEnum.Post,
                 postId,
                 initiatorId,

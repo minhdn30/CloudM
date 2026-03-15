@@ -6,6 +6,8 @@ using CloudM.Application.DTOs.AccountSettingDTOs;
 using CloudM.Application.DTOs.AuthDTOs;
 using CloudM.Application.DTOs.CommonDTOs;
 using CloudM.Application.DTOs.FollowDTOs;
+using CloudM.Application.DTOs.SearchDTOs;
+using CloudM.Application.Helpers.CloudinaryHelpers;
 using CloudM.Application.Helpers.StoryHelpers;
 using CloudM.Application.Services.AuthServices;
 using CloudM.Infrastructure.Services.Cloudinary;
@@ -151,10 +153,11 @@ namespace CloudM.Application.Services.AccountServices
                 throw new NotFoundException($"Account with ID {accountId} not found.");
             }
 
-            string? oldAvatarPublicId = null;
-            string? oldCoverPublicId = null;
+            string? oldAvatarUrl = null;
+            string? oldCoverUrl = null;
             string? newAvatarUrl = null;
             string? newCoverUrl = null;
+            var cleanupPlan = new CloudinaryCleanupPlan(_cloudinary);
 
             // prepare cloudinary upload tasks
             var uploadTasks = new List<Task>();
@@ -162,43 +165,53 @@ namespace CloudM.Application.Services.AccountServices
             if (request.DeleteAvatar == true)
             {
                 if (!string.IsNullOrEmpty(account.AvatarUrl))
-                    oldAvatarPublicId = _cloudinary.GetPublicIdFromUrl(account.AvatarUrl);
+                    oldAvatarUrl = account.AvatarUrl;
             }
             else if (request.AvatarFile != null)
             {
                 if (!string.IsNullOrEmpty(account.AvatarUrl))
-                    oldAvatarPublicId = _cloudinary.GetPublicIdFromUrl(account.AvatarUrl);
+                    oldAvatarUrl = account.AvatarUrl;
 
                 uploadTasks.Add(Task.Run(async () => {
                     newAvatarUrl = await _cloudinary.UploadImageAsync(request.AvatarFile);
+                    cleanupPlan.AddRollbackDeleteByUrl(newAvatarUrl, MediaTypeEnum.Image);
                 }));
             }
 
             if (request.DeleteCover == true)
             {
                 if (!string.IsNullOrEmpty(account.CoverUrl))
-                    oldCoverPublicId = _cloudinary.GetPublicIdFromUrl(account.CoverUrl);
+                    oldCoverUrl = account.CoverUrl;
             }
             else if (request.CoverFile != null)
             {
                 if (!string.IsNullOrEmpty(account.CoverUrl))
-                    oldCoverPublicId = _cloudinary.GetPublicIdFromUrl(account.CoverUrl);
+                    oldCoverUrl = account.CoverUrl;
 
                 uploadTasks.Add(Task.Run(async () => {
                     newCoverUrl = await _cloudinary.UploadImageAsync(request.CoverFile);
+                    cleanupPlan.AddRollbackDeleteByUrl(newCoverUrl, MediaTypeEnum.Image);
                 }));
             }
 
             // sync point
             if (uploadTasks.Any())
             {
-                await Task.WhenAll(uploadTasks);
-                
-                // verify results
-                if (request.AvatarFile != null && string.IsNullOrEmpty(newAvatarUrl))
-                    throw new InternalServerException("Avatar upload failed.");
-                if (request.CoverFile != null && string.IsNullOrEmpty(newCoverUrl))
-                    throw new InternalServerException("Cover image upload failed.");
+                try
+                {
+                    await Task.WhenAll(uploadTasks);
+
+                    // verify results
+                    if (request.AvatarFile != null && string.IsNullOrEmpty(newAvatarUrl))
+                        throw new InternalServerException("Avatar upload failed.");
+                    if (request.CoverFile != null && string.IsNullOrEmpty(newCoverUrl))
+                        throw new InternalServerException("Cover image upload failed.");
+                }
+                catch
+                {
+                    await cleanupPlan.ExecuteRollbackAsync();
+                    throw;
+                }
             }
 
             // start db transaction
@@ -265,31 +278,13 @@ namespace CloudM.Application.Services.AccountServices
                     return _mapper.Map<AccountDetailResponse>(account);
                 },
                 // rollback cleanup for new images
-                async () =>
-                {
-                    var orphanTasks = new List<Task>();
-                    if (!string.IsNullOrEmpty(newAvatarUrl))
-                    {
-                        var pid = _cloudinary.GetPublicIdFromUrl(newAvatarUrl);
-                        if (!string.IsNullOrEmpty(pid)) orphanTasks.Add(_cloudinary.DeleteMediaAsync(pid, MediaTypeEnum.Image));
-                    }
-                    if (!string.IsNullOrEmpty(newCoverUrl))
-                    {
-                        var pid = _cloudinary.GetPublicIdFromUrl(newCoverUrl);
-                        if (!string.IsNullOrEmpty(pid)) orphanTasks.Add(_cloudinary.DeleteMediaAsync(pid, MediaTypeEnum.Image));
-                    }
-                    if (orphanTasks.Any()) await Task.WhenAll(orphanTasks);
-                }
+                cleanupPlan.ExecuteRollbackAsync
             );
 
             // post commit cleanup old images
-            var cleanupTasks = new List<Task>();
-            if (!string.IsNullOrEmpty(oldAvatarPublicId))
-                cleanupTasks.Add(_cloudinary.DeleteMediaAsync(oldAvatarPublicId, MediaTypeEnum.Image));
-            if (!string.IsNullOrEmpty(oldCoverPublicId))
-                cleanupTasks.Add(_cloudinary.DeleteMediaAsync(oldCoverPublicId, MediaTypeEnum.Image));
-            
-            if (cleanupTasks.Any()) await Task.WhenAll(cleanupTasks);
+            cleanupPlan.AddPostCommitDeleteByUrl(oldAvatarUrl, MediaTypeEnum.Image);
+            cleanupPlan.AddPostCommitDeleteByUrl(oldCoverUrl, MediaTypeEnum.Image);
+            await cleanupPlan.ExecutePostCommitAsync();
             
             // real-time notification
             _ = _realtimeService.NotifyProfileUpdatedAsync(accountId, result);
@@ -351,7 +346,8 @@ namespace CloudM.Application.Services.AccountServices
                 StoryHighlightPrivacy = profileModel.StoryHighlightPrivacy,
                 GroupChatInvitePermission = profileModel.GroupChatInvitePermission,
                 OnlineStatusVisibility = profileModel.OnlineStatusVisibility,
-                TagPermission = profileModel.TagPermission
+                TagPermission = profileModel.TagPermission,
+                SoundEffectsEnabled = profileModel.SoundEffectsEnabled
             };
 
             // enforce privacy logic
@@ -435,7 +431,8 @@ namespace CloudM.Application.Services.AccountServices
                 StoryHighlightPrivacy = profileModel.StoryHighlightPrivacy,
                 GroupChatInvitePermission = profileModel.GroupChatInvitePermission,
                 OnlineStatusVisibility = profileModel.OnlineStatusVisibility,
-                TagPermission = profileModel.TagPermission
+                TagPermission = profileModel.TagPermission,
+                SoundEffectsEnabled = profileModel.SoundEffectsEnabled
             };
 
             // Enforce privacy logic
@@ -507,6 +504,25 @@ namespace CloudM.Application.Services.AccountServices
             return result;
         }
 
+        public async Task<List<SidebarAccountSearchResponse>> SearchSidebarAccountsAsync(
+            Guid currentId,
+            string keyword,
+            int limit = 20)
+        {
+            var normalizedKeyword = keyword?.Trim() ?? string.Empty;
+            if (normalizedKeyword.Length == 0)
+            {
+                return new List<SidebarAccountSearchResponse>();
+            }
+
+            var results = await _accountRepository.SearchSidebarAccountsAsync(
+                currentId,
+                normalizedKeyword,
+                limit);
+
+            return results.Select(MapSidebarAccountSearchResponse).ToList();
+        }
+
         public async Task<List<PostTagAccountSearchResponse>> SearchAccountsForPostTagAsync(
             Guid currentId,
             Guid? visibilityOwnerId,
@@ -544,6 +560,23 @@ namespace CloudM.Application.Services.AccountServices
                 RecentChatScore = x.RecentChatScore,
                 TotalScore = x.TotalScore
             }).ToList();
+        }
+
+        private static SidebarAccountSearchResponse MapSidebarAccountSearchResponse(
+            SidebarAccountSearchModel item)
+        {
+            return new SidebarAccountSearchResponse
+            {
+                AccountId = item.AccountId,
+                Username = item.Username,
+                FullName = item.FullName,
+                AvatarUrl = item.AvatarUrl,
+                IsFollowing = item.IsFollowing,
+                IsFollower = item.IsFollower,
+                HasDirectConversation = item.HasDirectConversation,
+                LastContactedAt = item.LastContactedAt,
+                LastSearchedAt = item.LastSearchedAt
+            };
         }
 
         private async Task<StoryRingStateEnum> ResolveStoryRingStateAsync(Guid targetId, Guid? currentId)

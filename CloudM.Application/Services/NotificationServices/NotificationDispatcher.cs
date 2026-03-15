@@ -20,13 +20,23 @@ namespace CloudM.Application.Services.NotificationServices
 
             if (result.Action == NotificationProjectionActionEnum.Upsert)
             {
-                await _realtimeService.NotifyNotificationUpsertAsync(result.RecipientId, result.NotificationId);
+                await _realtimeService.NotifyNotificationUpsertAsync(
+                    result.RecipientId,
+                    result.NotificationId,
+                    result.EventId,
+                    result.OccurredAt,
+                    result.AffectsUnread,
+                    result.Toast);
                 return;
             }
 
             if (result.Action == NotificationProjectionActionEnum.Remove && result.NotificationId.HasValue)
             {
-                await _realtimeService.NotifyNotificationRemovedAsync(result.RecipientId, result.NotificationId.Value);
+                await _realtimeService.NotifyNotificationRemovedAsync(
+                    result.RecipientId,
+                    result.NotificationId.Value,
+                    result.EventId,
+                    result.OccurredAt);
             }
         }
     }

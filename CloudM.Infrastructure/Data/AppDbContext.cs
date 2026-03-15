@@ -14,10 +14,13 @@ namespace CloudM.Infrastructure.Data
         public AppDbContext(DbContextOptions<AppDbContext> options) : base(options) { }
         public static string Unaccent(string text) => throw new NotSupportedException();
         public static double Similarity(string source, string target) => throw new NotSupportedException();
+        public static long HashTextExtended(string text, long seed) => throw new NotSupportedException();
         public virtual DbSet<Account> Accounts { get; set; }
         public virtual DbSet<Role> Roles { get; set; }
         public virtual DbSet<ExternalLogin> ExternalLogins { get; set; }
         public virtual DbSet<EmailVerification> EmailVerifications { get; set; }
+        public virtual DbSet<AccountBlock> AccountBlocks { get; set; }
+        public virtual DbSet<AccountSearchHistory> AccountSearchHistories { get; set; }
         public virtual DbSet<Follow> Follows { get; set; }
         public virtual DbSet<FollowRequest> FollowRequests { get; set; }
         public virtual DbSet<Post> Posts { get; set; }
@@ -39,7 +42,11 @@ namespace CloudM.Infrastructure.Data
         public virtual DbSet<MessageReact> MessageReacts { get; set; }
         public virtual DbSet<PinnedMessage> PinnedMessages { get; set; }
         public virtual DbSet<AccountSettings> AccountSettings { get; set; } = null!;
+        public virtual DbSet<AdminAuditLog> AdminAuditLogs { get; set; } = null!;
+        public virtual DbSet<ModerationReport> ModerationReports { get; set; } = null!;
+        public virtual DbSet<ModerationReportAction> ModerationReportActions { get; set; } = null!;
         public virtual DbSet<Notification> Notifications { get; set; } = null!;
+        public virtual DbSet<NotificationReadState> NotificationReadStates { get; set; } = null!;
         public virtual DbSet<NotificationContribution> NotificationContributions { get; set; } = null!;
         public virtual DbSet<NotificationOutbox> NotificationOutboxes { get; set; } = null!;
 
@@ -80,6 +87,11 @@ namespace CloudM.Infrastructure.Data
                       .WithOne(s => s.Account)
                       .HasForeignKey<AccountSettings>(s => s.AccountId)
                       .OnDelete(DeleteBehavior.Cascade);
+
+                entity.HasOne(a => a.NotificationReadState)
+                      .WithOne(s => s.Account)
+                      .HasForeignKey<NotificationReadState>(s => s.AccountId)
+                      .OnDelete(DeleteBehavior.Cascade);
             });
 
             modelBuilder.Entity<ExternalLogin>(entity =>
@@ -98,6 +110,45 @@ namespace CloudM.Infrastructure.Data
                       .OnDelete(DeleteBehavior.Cascade);
             });
 
+            modelBuilder.Entity<AccountBlock>(entity =>
+            {
+                entity.HasKey(x => new { x.BlockerId, x.BlockedId });
+
+                entity.HasIndex(x => new { x.BlockerId, x.CreatedAt })
+                    .HasDatabaseName("IX_AccountBlocks_Blocker_CreatedAt");
+
+                entity.HasIndex(x => new { x.BlockedId, x.CreatedAt })
+                    .HasDatabaseName("IX_AccountBlocks_Blocked_CreatedAt");
+
+                entity.HasOne(x => x.Blocker)
+                    .WithMany(x => x.BlocksInitiated)
+                    .HasForeignKey(x => x.BlockerId)
+                    .OnDelete(DeleteBehavior.NoAction);
+
+                entity.HasOne(x => x.Blocked)
+                    .WithMany(x => x.BlocksReceived)
+                    .HasForeignKey(x => x.BlockedId)
+                    .OnDelete(DeleteBehavior.NoAction);
+            });
+
+            modelBuilder.Entity<AccountSearchHistory>(entity =>
+            {
+                entity.HasKey(x => new { x.CurrentId, x.TargetId });
+
+                entity.HasIndex(x => new { x.CurrentId, x.LastSearchedAt })
+                    .HasDatabaseName("IX_AccountSearchHistories_Current_LastSearchedAt");
+
+                entity.HasOne(x => x.Current)
+                    .WithMany()
+                    .HasForeignKey(x => x.CurrentId)
+                    .OnDelete(DeleteBehavior.NoAction);
+
+                entity.HasOne(x => x.Target)
+                    .WithMany()
+                    .HasForeignKey(x => x.TargetId)
+                    .OnDelete(DeleteBehavior.NoAction);
+            });
+
             // Enable extensions
             modelBuilder.HasPostgresExtension("pg_trgm");
             modelBuilder.HasPostgresExtension("unaccent");
@@ -108,6 +159,8 @@ namespace CloudM.Infrastructure.Data
                 .HasName("immutable_unaccent");
             modelBuilder.HasDbFunction(typeof(AppDbContext).GetMethod(nameof(Similarity), new[] { typeof(string), typeof(string) })!)
                 .HasName("similarity");
+            modelBuilder.HasDbFunction(typeof(AppDbContext).GetMethod(nameof(HashTextExtended), new[] { typeof(string), typeof(long) })!)
+                .HasName("hashtextextended");
 
 
 
@@ -201,9 +254,6 @@ namespace CloudM.Infrastructure.Data
                 entity.HasIndex(x => new { x.RecipientId, x.LastEventAt, x.NotificationId })
                     .HasDatabaseName("IX_Notifications_Recipient_LastEventAt_NotificationId");
 
-                entity.HasIndex(x => new { x.RecipientId, x.IsRead, x.LastEventAt, x.NotificationId })
-                    .HasDatabaseName("IX_Notifications_Recipient_IsRead_LastEventAt_NotificationId");
-
                 entity.HasOne(x => x.Recipient)
                     .WithMany()
                     .HasForeignKey(x => x.RecipientId)
@@ -212,6 +262,16 @@ namespace CloudM.Infrastructure.Data
                 entity.HasMany(x => x.Contributions)
                     .WithOne(x => x.Notification)
                     .HasForeignKey(x => x.NotificationId)
+                    .OnDelete(DeleteBehavior.Cascade);
+            });
+
+            modelBuilder.Entity<NotificationReadState>(entity =>
+            {
+                entity.HasKey(x => x.AccountId);
+
+                entity.HasOne(x => x.Account)
+                    .WithOne(x => x.NotificationReadState)
+                    .HasForeignKey<NotificationReadState>(x => x.AccountId)
                     .OnDelete(DeleteBehavior.Cascade);
             });
 
@@ -255,6 +315,77 @@ namespace CloudM.Infrastructure.Data
                 entity.HasOne(x => x.Recipient)
                     .WithMany()
                     .HasForeignKey(x => x.RecipientId)
+                    .OnDelete(DeleteBehavior.Cascade);
+            });
+
+            modelBuilder.Entity<AdminAuditLog>(entity =>
+            {
+                entity.HasKey(x => x.AdminAuditLogId);
+
+                entity.HasIndex(x => new { x.CreatedAt, x.AdminAuditLogId })
+                    .HasDatabaseName("IX_AdminAuditLogs_CreatedAt_AdminAuditLogId");
+
+                entity.HasIndex(x => new { x.AdminId, x.CreatedAt })
+                    .HasDatabaseName("IX_AdminAuditLogs_AdminId_CreatedAt");
+
+                entity.HasIndex(x => new { x.Module, x.ActionType, x.CreatedAt })
+                    .HasDatabaseName("IX_AdminAuditLogs_Module_ActionType_CreatedAt");
+
+                entity.HasOne(x => x.Admin)
+                    .WithMany()
+                    .HasForeignKey(x => x.AdminId)
+                    .OnDelete(DeleteBehavior.Cascade);
+            });
+
+            modelBuilder.Entity<ModerationReport>(entity =>
+            {
+                entity.HasKey(x => x.ModerationReportId);
+
+                entity.HasIndex(x => new { x.Status, x.CreatedAt, x.ModerationReportId })
+                    .HasDatabaseName("IX_ModerationReports_Status_CreatedAt_ReportId");
+
+                entity.HasIndex(x => new { x.TargetType, x.TargetId, x.CreatedAt })
+                    .HasDatabaseName("IX_ModerationReports_TargetType_TargetId_CreatedAt");
+
+                entity.HasIndex(x => new { x.ReporterAccountId, x.TargetType, x.TargetId })
+                    .IsUnique()
+                    .HasDatabaseName("IX_ModerationReports_UserSubmittedPendingUnique")
+                    .HasFilter("\"ReporterAccountId\" IS NOT NULL AND \"SourceType\" = 1 AND \"Status\" IN (0, 1)");
+
+                entity.HasOne(x => x.ReporterAccount)
+                    .WithMany()
+                    .HasForeignKey(x => x.ReporterAccountId)
+                    .OnDelete(DeleteBehavior.SetNull);
+
+                entity.HasOne(x => x.CreatedByAdmin)
+                    .WithMany()
+                    .HasForeignKey(x => x.CreatedByAdminId)
+                    .OnDelete(DeleteBehavior.SetNull);
+
+                entity.HasOne(x => x.ResolvedByAdmin)
+                    .WithMany()
+                    .HasForeignKey(x => x.ResolvedByAdminId)
+                    .OnDelete(DeleteBehavior.SetNull);
+            });
+
+            modelBuilder.Entity<ModerationReportAction>(entity =>
+            {
+                entity.HasKey(x => x.ModerationReportActionId);
+
+                entity.HasIndex(x => new { x.ModerationReportId, x.CreatedAt })
+                    .HasDatabaseName("IX_ModerationReportActions_ReportId_CreatedAt");
+
+                entity.HasIndex(x => new { x.AdminId, x.CreatedAt })
+                    .HasDatabaseName("IX_ModerationReportActions_AdminId_CreatedAt");
+
+                entity.HasOne(x => x.Report)
+                    .WithMany(x => x.Actions)
+                    .HasForeignKey(x => x.ModerationReportId)
+                    .OnDelete(DeleteBehavior.Cascade);
+
+                entity.HasOne(x => x.Admin)
+                    .WithMany()
+                    .HasForeignKey(x => x.AdminId)
                     .OnDelete(DeleteBehavior.Cascade);
             });
 
@@ -338,6 +469,14 @@ namespace CloudM.Infrastructure.Data
             // =====================
             modelBuilder.Entity<PostReact>()
                 .HasKey(r => new { r.PostId, r.AccountId });
+
+            modelBuilder.Entity<PostReact>()
+                .HasIndex(r => new { r.AccountId, r.CreatedAt, r.PostId })
+                .HasDatabaseName("IX_PostReacts_Account_CreatedAt_PostId");
+
+            modelBuilder.Entity<PostReact>()
+                .HasIndex(r => new { r.PostId, r.CreatedAt })
+                .HasDatabaseName("IX_PostReacts_Post_CreatedAt");
 
             // PostReact → Account
             modelBuilder.Entity<PostReact>()
@@ -572,7 +711,7 @@ namespace CloudM.Infrastructure.Data
                 .HasKey(c => c.CommentId);
 
             modelBuilder.Entity<Comment>()
-                .HasIndex(c => new { c.PostId, c.ParentCommentId, c.CreatedAt })
+                .HasIndex(c => new { c.PostId, c.ParentCommentId, c.CreatedAt, c.CommentId })
                 .HasDatabaseName("IX_Comment_Post_Parent_Created");
 
             // Index for per-post interactions by account (feed affinity query)
@@ -581,13 +720,17 @@ namespace CloudM.Infrastructure.Data
                 .HasDatabaseName("IX_Comment_Post_Account_Created");
 
             modelBuilder.Entity<Comment>()
-                .HasIndex(c => new { c.ParentCommentId, c.CreatedAt })
+                .HasIndex(c => new { c.ParentCommentId, c.CreatedAt, c.CommentId })
                 .HasDatabaseName("IX_Comment_Parent_Created");
 
             // Index for querying comments by account
             modelBuilder.Entity<Comment>()
                 .HasIndex(c => c.AccountId)
                 .HasDatabaseName("IX_Comment_AccountId");
+
+            modelBuilder.Entity<Comment>()
+                .HasIndex(c => new { c.AccountId, c.CreatedAt, c.PostId })
+                .HasDatabaseName("IX_Comment_Account_CreatedAt_PostId");
 
             // Comment → Account
             modelBuilder.Entity<Comment>()
@@ -657,10 +800,6 @@ namespace CloudM.Infrastructure.Data
                 .ToTable(table => table.HasCheckConstraint(
                     "CK_Conversations_GroupOwner",
                     "(\"IsGroup\" = FALSE AND \"Owner\" IS NULL) OR (\"IsGroup\" = TRUE AND \"Owner\" IS NOT NULL)"));
-
-            // Index: sort / filter conversations
-            modelBuilder.Entity<Conversation>()
-                .HasIndex(c => c.CreatedAt);
 
             modelBuilder.Entity<Conversation>()
                 .HasIndex(c => c.CreatedBy);

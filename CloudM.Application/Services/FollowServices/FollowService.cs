@@ -8,6 +8,7 @@ using CloudM.Infrastructure.Repositories.Accounts;
 using CloudM.Infrastructure.Repositories.Follows;
 using CloudM.Infrastructure.Repositories.FollowRequests;
 using CloudM.Infrastructure.Repositories.AccountSettingRepos;
+using CloudM.Infrastructure.Repositories.AccountBlocks;
 using CloudM.Infrastructure.Repositories.UnitOfWork;
 using CloudM.Application.Services.NotificationServices;
 using CloudM.Application.Services.RealtimeServices;
@@ -30,6 +31,7 @@ namespace CloudM.Application.Services.FollowServices
         private readonly INotificationService _notificationService;
         private readonly IRealtimeService _realtimeService;
         private readonly IUnitOfWork _unitOfWork;
+        private readonly IAccountBlockRepository _accountBlockRepository;
 
         public FollowService(
             IFollowRepository followRepository,
@@ -39,7 +41,8 @@ namespace CloudM.Application.Services.FollowServices
             IAccountSettingRepository accountSettingRepository,
             INotificationService notificationService,
             IRealtimeService realtimeService,
-            IUnitOfWork unitOfWork)
+            IUnitOfWork unitOfWork,
+            IAccountBlockRepository? accountBlockRepository = null)
         {
             _followRepository = followRepository;
             _followRequestRepository = followRequestRepository;
@@ -49,6 +52,7 @@ namespace CloudM.Application.Services.FollowServices
             _notificationService = notificationService;
             _realtimeService = realtimeService;
             _unitOfWork = unitOfWork;
+            _accountBlockRepository = accountBlockRepository ?? NullAccountBlockRepository.Instance;
         }
 
         public FollowService(
@@ -82,6 +86,9 @@ namespace CloudM.Application.Services.FollowServices
 
             if (!await _accountRepository.IsAccountIdExist(followerId))
                 throw new ForbiddenException("You must reactivate your account to follow users.");
+
+            if (await _accountBlockRepository.IsBlockedEitherWayAsync(followerId, targetId))
+                throw new BadRequestException("This user is unavailable or does not exist.");
 
             var recordExists = await _followRepository.IsFollowRecordExistAsync(followerId, targetId);
             if (recordExists)
@@ -118,7 +125,25 @@ namespace CloudM.Application.Services.FollowServices
                         myCounts.Following,
                         "follow_request_sent");
 
-                    await _realtimeService.NotifyFollowRequestQueueChangedAsync(targetId, "upsert", followerId);
+                    var requesterAccount = await _accountRepository.GetAccountById(followerId);
+                    await _realtimeService.NotifyFollowRequestQueueChangedAsync(
+                        targetId,
+                        "upsert",
+                        followerId,
+                        requesterAccount == null
+                            ? null
+                            : new NotificationToastPayload
+                            {
+                                Type = (int)NotificationTypeEnum.FollowRequest,
+                                ActorAccountId = requesterAccount.AccountId,
+                                ActorUsername = requesterAccount.Username ?? string.Empty,
+                                ActorFullName = requesterAccount.FullName,
+                                ActorAvatarUrl = requesterAccount.AvatarUrl,
+                                TargetKind = (int)NotificationTargetKindEnum.Account,
+                                TargetId = followerId,
+                                TargetPostCode = null,
+                                CanOpen = true
+                            });
 
                     return BuildFollowCountResponse(
                         targetCounts,
@@ -396,12 +421,14 @@ namespace CloudM.Application.Services.FollowServices
                     safeRequest.CursorCreatedAt,
                     safeRequest.CursorRequesterId,
                     cancellationToken);
-            var totalCount = await _followRequestRepository.GetPendingCountByTargetAsync(
+            var unreadSummary = await _notificationService.GetUnreadSummaryAsync(
                 currentId,
                 cancellationToken);
+            var totalCount = unreadSummary.PendingFollowRequestCount;
 
             return new FollowRequestCursorResponse
             {
+                AccountId = currentId,
                 Items = items
                     .Select(x => new FollowRequestItemResponse
                     {
@@ -412,7 +439,13 @@ namespace CloudM.Application.Services.FollowServices
                         CreatedAt = x.CreatedAt
                     })
                     .ToList(),
+                Count = unreadSummary.Count,
+                NotificationUnreadCount = unreadSummary.NotificationUnreadCount,
+                FollowRequestUnreadCount = unreadSummary.FollowRequestUnreadCount,
+                PendingFollowRequestCount = unreadSummary.PendingFollowRequestCount,
                 TotalCount = totalCount,
+                LastNotificationsSeenAt = unreadSummary.LastNotificationsSeenAt,
+                LastFollowRequestsSeenAt = unreadSummary.LastFollowRequestsSeenAt,
                 NextCursor = nextCursorCreatedAt.HasValue && nextCursorRequesterId.HasValue
                     ? new FollowRequestNextCursorResponse
                     {
@@ -762,6 +795,75 @@ namespace CloudM.Application.Services.FollowServices
                 PageSize = request.PageSize
             };
         }
+
+        public async Task<PagedResponse<FollowSuggestionModel>> GetSuggestionsAsync(Guid currentId, FollowSuggestionPagingRequest request)
+        {
+            if (!await _accountRepository.IsAccountIdExist(currentId))
+                throw new ForbiddenException("You must reactivate your account to view follow suggestions.");
+
+            var (normalizedPage, normalizedPageSize, prioritizeDiscovery) =
+                NormalizeSuggestionRequest(request, true);
+
+            var (items, total) = await _accountRepository.GetFollowSuggestionsAsync(
+                currentId,
+                normalizedPage,
+                normalizedPageSize,
+                prioritizeDiscovery);
+
+            return new PagedResponse<FollowSuggestionModel>
+            {
+                Items = items.Select(x => new FollowSuggestionModel
+                {
+                    AccountId = x.AccountId,
+                    Username = x.Username,
+                    FullName = x.FullName,
+                    AvatarUrl = x.AvatarUrl
+                }),
+                TotalItems = total,
+                Page = normalizedPage,
+                PageSize = normalizedPageSize
+            };
+        }
+
+        public async Task<PagedResponse<FollowSuggestionPageModel>> GetSuggestionPageAsync(Guid currentId, FollowSuggestionPagingRequest request)
+        {
+            if (!await _accountRepository.IsAccountIdExist(currentId))
+                throw new ForbiddenException("You must reactivate your account to view follow suggestions.");
+
+            var (normalizedPage, normalizedPageSize, prioritizeDiscovery) =
+                NormalizeSuggestionRequest(request, false);
+
+            var (items, total) = await _accountRepository.GetFollowSuggestionsAsync(
+                currentId,
+                normalizedPage,
+                normalizedPageSize,
+                prioritizeDiscovery);
+
+            var previewUsernames = await _accountRepository.GetMutualFollowPreviewUsernamesAsync(
+                currentId,
+                items.Select(x => x.AccountId),
+                2);
+
+            return new PagedResponse<FollowSuggestionPageModel>
+            {
+                Items = items.Select(x => new FollowSuggestionPageModel
+                {
+                    AccountId = x.AccountId,
+                    Username = x.Username,
+                    FullName = x.FullName,
+                    AvatarUrl = x.AvatarUrl,
+                    IsContact = x.IsContact,
+                    IsFollower = x.IsFollower,
+                    HasDirectConversation = x.HasDirectConversation,
+                    LastContactedAt = x.LastContactedAt,
+                    MutualFollowCount = x.MutualFollowCount,
+                    MutualFollowPreviewUsernames = previewUsernames.GetValueOrDefault(x.AccountId, new List<string>())
+                }),
+                TotalItems = total,
+                Page = normalizedPage,
+                PageSize = normalizedPageSize
+            };
+        }
         
         public async Task<FollowCountResponse> GetStatsAsync(Guid userId)
         {
@@ -796,6 +898,20 @@ namespace CloudM.Application.Services.FollowServices
                 RelationStatus = ResolveRelationStatus(isFollowing, normalizedIsRequested),
                 TargetFollowPrivacy = targetFollowPrivacy
             };
+        }
+
+        private static (int Page, int PageSize, bool PrioritizeDiscovery) NormalizeSuggestionRequest(
+            FollowSuggestionPagingRequest? request,
+            bool prioritizeDiscovery)
+        {
+            var safeRequest = request ?? new FollowSuggestionPagingRequest();
+            var normalizedPage = safeRequest.Page <= 0 ? 1 : safeRequest.Page;
+            var maxPageSize = prioritizeDiscovery ? 12 : 20;
+            var normalizedPageSize = safeRequest.PageSize <= 0
+                ? (prioritizeDiscovery ? 5 : 12)
+                : Math.Min(safeRequest.PageSize, maxPageSize);
+
+            return (normalizedPage, normalizedPageSize, prioritizeDiscovery);
         }
 
         private static FollowRelationStatusEnum ResolveRelationStatus(bool isFollowing, bool isFollowRequestPending)

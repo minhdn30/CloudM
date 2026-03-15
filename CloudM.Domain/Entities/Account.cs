@@ -33,7 +33,7 @@ namespace CloudM.Domain.Entities
         public string? PasswordHash { get; set; }
         [MaxLength(255)]
         public string? Address { get; set; }
-        public int RoleId { get; set; }
+        public int RoleId { get; set; } = (int)RoleEnum.User;
         public AccountStatusEnum Status { get; set; } = 0;
         public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
         public DateTime? UpdatedAt { get; set; }
@@ -46,6 +46,8 @@ namespace CloudM.Domain.Entities
         public ICollection<Follow> Followings { get; set; } = new List<Follow>(); // Accounts that this account follows
         public ICollection<FollowRequest> FollowRequestsReceived { get; set; } = new List<FollowRequest>(); // Accounts requesting to follow this account
         public ICollection<FollowRequest> FollowRequestsSent { get; set; } = new List<FollowRequest>(); // Follow requests created by this account
+        public ICollection<AccountBlock> BlocksInitiated { get; set; } = new List<AccountBlock>();
+        public ICollection<AccountBlock> BlocksReceived { get; set; } = new List<AccountBlock>();
         public virtual ICollection<Post> Posts { get; set; } = new List<Post>();
         public virtual ICollection<Story> Stories { get; set; } = new List<Story>();
         public virtual ICollection<StoryView> StoryViews { get; set; } = new List<StoryView>();
@@ -66,6 +68,7 @@ namespace CloudM.Domain.Entities
         public virtual ICollection<Conversation> CreatedConversations { get; set; } = new List<Conversation>();
         public virtual ICollection<Conversation> OwnedConversations { get; set; } = new List<Conversation>();
         public virtual AccountSettings Settings { get; set; } = null!;
+        public virtual NotificationReadState? NotificationReadState { get; set; }
 
     }
 }

@@ -4,13 +4,16 @@ using CloudM.Application.DTOs.CommonDTOs;
 using CloudM.Application.DTOs.MessageDTOs;
 using CloudM.Application.DTOs.MessageMediaDTOs;
 using CloudM.Application.Helpers.FileTypeHelpers;
+using CloudM.Application.Helpers.CloudinaryHelpers;
 using CloudM.Application.Helpers.ValidationHelpers;
 using CloudM.Infrastructure.Services.Cloudinary;
 using CloudM.Application.Services.ConversationServices;
 using CloudM.Domain.Entities;
 using CloudM.Domain.Enums;
+using CloudM.Domain.Helpers;
 using CloudM.Infrastructure.Models;
 using CloudM.Infrastructure.Repositories.Accounts;
+using CloudM.Infrastructure.Repositories.AccountBlocks;
 using CloudM.Infrastructure.Repositories.ConversationMembers;
 using CloudM.Infrastructure.Repositories.Conversations;
 using CloudM.Infrastructure.Repositories.MessageMedias;
@@ -54,12 +57,14 @@ namespace CloudM.Application.Services.MessageServices
         private readonly IRealtimeService _realtimeService;
         private readonly IUnitOfWork _unitOfWork;
         private readonly string _groupAllMentionKeyword;
+        private readonly IAccountBlockRepository _accountBlockRepository;
 
         public MessageService(IMessageRepository messageRepository, IMessageMediaRepository messageMediaRepository,
             IConversationRepository conversationRepository, IConversationMemberRepository conversationMemberRepository,
             IAccountRepository accountRepository, IPostRepository postRepository, IMapper mapper, ICloudinaryService cloudinaryService,
             IFileTypeDetector fileTypeDetector, IStoryRepository storyRepository, INotificationService notificationService, IRealtimeService realtimeService, IUnitOfWork unitOfWork,
-            IOptions<ChatMentionOptions>? chatMentionOptions = null)
+            IOptions<ChatMentionOptions>? chatMentionOptions = null,
+            IAccountBlockRepository? accountBlockRepository = null)
         {
             _messageRepository = messageRepository;
             _messageMediaRepository = messageMediaRepository;
@@ -75,6 +80,7 @@ namespace CloudM.Application.Services.MessageServices
             _realtimeService = realtimeService;
             _unitOfWork = unitOfWork;
             _groupAllMentionKeyword = NormalizeGroupAllKeyword(chatMentionOptions?.Value?.GroupAllKeyword);
+            _accountBlockRepository = accountBlockRepository ?? NullAccountBlockRepository.Instance;
         }
 
         public MessageService(IMessageRepository messageRepository, IMessageMediaRepository messageMediaRepository,
@@ -134,57 +140,69 @@ namespace CloudM.Application.Services.MessageServices
             
             if (receiver == null)
                 throw new BadRequestException($"Receiver account with ID {request.ReceiverId} does not exist.");
-            if (receiver.Status != AccountStatusEnum.Active)
+            if (!SocialRoleRules.IsSocialEligible(receiver))
                 throw new BadRequestException("This user is currently unavailable.");
 
             if(sender == null) 
                 throw new BadRequestException($"Sender account with ID {senderId} does not exist.");
-            if (sender.Status != AccountStatusEnum.Active)
+            if (!SocialRoleRules.IsSocialEligible(sender))
                 throw new ForbiddenException("You must reactivate your account to send messages.");
+            if (await _accountBlockRepository.IsBlockedEitherWayAsync(senderId, request.ReceiverId))
+                throw new BadRequestException("This user is currently unavailable.");
             
-            var now = DateTime.UtcNow;
+	            var now = DateTime.UtcNow;
 
-            // === media upload phase (before transaction) ===, track uploaded URLs for cleanup) ===
-            var uploadedMedia = new List<(string url, MediaTypeEnum type)>();
-            var mediaEntities = new List<MessageMedia>();
-            
-            if (request.MediaFiles != null && request.MediaFiles.Any())
-            {
-                foreach (var file in request.MediaFiles)
-                {
-                    var detectedType = await _fileTypeDetector.GetMediaTypeAsync(file);
-                    if (detectedType == null) continue;
-                    
-                    string? url = null;
-                    switch(detectedType.Value)
-                    {
-                        case MediaTypeEnum.Image:
-                            url = await _cloudinaryService.UploadImageAsync(file);
-                            break;
-                        case MediaTypeEnum.Video:
-                            url = await _cloudinaryService.UploadVideoAsync(file);
-                            break;
-                        case MediaTypeEnum.Document:
-                            url = await _cloudinaryService.UploadRawFileAsync(file);
-                            break;
-                        default:
-                            continue; 
-                    };
-                    
-                    if (!string.IsNullOrEmpty(url))
-                    {
-                        uploadedMedia.Add((url, detectedType.Value));
-                        mediaEntities.Add(new MessageMedia
-                        {
-                            MediaUrl = url,
-                            MediaType = detectedType.Value,
-                            FileName = file.FileName,
-                            FileSize = file.Length,
-                            CreatedAt = now
-                        });
-                    }
-                }
-            }
+	            // === media upload phase (before transaction) ===, track uploaded URLs for cleanup) ===
+	            var uploadedMedia = new List<(string url, MediaTypeEnum type)>();
+	            var mediaEntities = new List<MessageMedia>();
+	            var cleanupPlan = new CloudinaryCleanupPlan(_cloudinaryService);
+
+	            try
+	            {
+	                if (request.MediaFiles != null && request.MediaFiles.Any())
+	                {
+	                    foreach (var file in request.MediaFiles)
+	                    {
+	                        var detectedType = await _fileTypeDetector.GetMediaTypeAsync(file);
+	                        if (detectedType == null) continue;
+
+	                        string? url = null;
+	                        switch(detectedType.Value)
+	                        {
+	                            case MediaTypeEnum.Image:
+	                                url = await _cloudinaryService.UploadImageAsync(file);
+	                                break;
+	                            case MediaTypeEnum.Video:
+	                                url = await _cloudinaryService.UploadVideoAsync(file);
+	                                break;
+	                            case MediaTypeEnum.Document:
+	                                url = await _cloudinaryService.UploadRawFileAsync(file);
+	                                break;
+	                            default:
+	                                continue;
+	                        };
+
+	                        if (!string.IsNullOrEmpty(url))
+	                        {
+	                            cleanupPlan.AddRollbackDeleteByUrl(url, detectedType.Value);
+	                            uploadedMedia.Add((url, detectedType.Value));
+	                            mediaEntities.Add(new MessageMedia
+	                            {
+	                                MediaUrl = url,
+	                                MediaType = detectedType.Value,
+	                                FileName = file.FileName,
+	                                FileSize = file.Length,
+	                                CreatedAt = now
+	                            });
+	                        }
+	                    }
+	                }
+	            }
+	            catch
+	            {
+	                await cleanupPlan.ExecuteRollbackAsync();
+	                throw;
+	            }
             
             // === database transaction phase ===
             return await _unitOfWork.ExecuteInTransactionAsync(
@@ -278,17 +296,7 @@ namespace CloudM.Application.Services.MessageServices
                     return result;
                 },
                 // Cleanup callback: delete orphaned cloud media if DB transaction fails
-                async () =>
-                {
-                    var cleanupTasks = uploadedMedia.Select(m =>
-                    {
-                        var publicId = _cloudinaryService.GetPublicIdFromUrl(m.url);
-                        return !string.IsNullOrEmpty(publicId) 
-                            ? _cloudinaryService.DeleteMediaAsync(publicId, m.type)
-                            : Task.CompletedTask;
-                    });
-                    await Task.WhenAll(cleanupTasks);
-                }
+                cleanupPlan.ExecuteRollbackAsync
             );
         }
 
@@ -314,7 +322,7 @@ namespace CloudM.Application.Services.MessageServices
             var sender = await _accountRepository.GetAccountById(senderId);
             if(sender == null) 
                 throw new BadRequestException($"Sender account with ID {senderId} does not exist.");
-            if (sender.Status != AccountStatusEnum.Active)
+            if (!SocialRoleRules.IsSocialEligible(sender))
                 throw new ForbiddenException("You must reactivate your account to send messages.");
 
             var sanitizedContent = request.Content;
@@ -324,7 +332,7 @@ namespace CloudM.Application.Services.MessageServices
                 var groupMembers = await _conversationMemberRepository.GetConversationMembersAsync(conversationId);
                 var mentionCandidates = groupMembers
                     .Where(member => member.Account != null
-                                     && member.Account.Status == AccountStatusEnum.Active
+                                     && SocialRoleRules.IsSocialEligible(member.Account)
                                      && !string.IsNullOrWhiteSpace(member.Account.Username))
                     .Select(member => member.Account!)
                     .GroupBy(account => account.AccountId)
@@ -339,50 +347,60 @@ namespace CloudM.Application.Services.MessageServices
                 mentionedAccountIds = mentionSanitizeResult.MentionedAccountIds;
             }
             
-            var now = DateTime.UtcNow;
+	            var now = DateTime.UtcNow;
 
-            // === media upload phase (before transaction) ===
-            var uploadedMedia = new List<(string url, MediaTypeEnum type)>();
-            var mediaEntities = new List<MessageMedia>();
-            
-            if (request.MediaFiles != null && request.MediaFiles.Any())
-            {
-                foreach (var file in request.MediaFiles)
-                {
-                    var detectedType = await _fileTypeDetector.GetMediaTypeAsync(file);
-                    if (detectedType == null)
-                        continue;
-                    
-                    string? url = null;
-                    switch(detectedType.Value)
-                    {
-                        case MediaTypeEnum.Image:
-                            url = await _cloudinaryService.UploadImageAsync(file);
-                            break;
-                        case MediaTypeEnum.Video:
-                            url = await _cloudinaryService.UploadVideoAsync(file);
-                            break;
-                        case MediaTypeEnum.Document:
-                            url = await _cloudinaryService.UploadRawFileAsync(file);
-                            break;
-                        default:
-                            continue; 
-                    };
-                    
-                    if (!string.IsNullOrEmpty(url))
-                    {
-                        uploadedMedia.Add((url, detectedType.Value));
-                        mediaEntities.Add(new MessageMedia
-                        {
-                            MediaUrl = url,
-                            MediaType = detectedType.Value,
-                            FileName = file.FileName,
-                            FileSize = file.Length,
-                            CreatedAt = now
-                        });
-                    }
-                }
-            }
+	            // === media upload phase (before transaction) ===
+	            var uploadedMedia = new List<(string url, MediaTypeEnum type)>();
+	            var mediaEntities = new List<MessageMedia>();
+	            var cleanupPlan = new CloudinaryCleanupPlan(_cloudinaryService);
+
+	            try
+	            {
+	                if (request.MediaFiles != null && request.MediaFiles.Any())
+	                {
+	                    foreach (var file in request.MediaFiles)
+	                    {
+	                        var detectedType = await _fileTypeDetector.GetMediaTypeAsync(file);
+	                        if (detectedType == null)
+	                            continue;
+
+	                        string? url = null;
+	                        switch(detectedType.Value)
+	                        {
+	                            case MediaTypeEnum.Image:
+	                                url = await _cloudinaryService.UploadImageAsync(file);
+	                                break;
+	                            case MediaTypeEnum.Video:
+	                                url = await _cloudinaryService.UploadVideoAsync(file);
+	                                break;
+	                            case MediaTypeEnum.Document:
+	                                url = await _cloudinaryService.UploadRawFileAsync(file);
+	                                break;
+	                            default:
+	                                continue;
+	                        };
+
+	                        if (!string.IsNullOrEmpty(url))
+	                        {
+	                            cleanupPlan.AddRollbackDeleteByUrl(url, detectedType.Value);
+	                            uploadedMedia.Add((url, detectedType.Value));
+	                            mediaEntities.Add(new MessageMedia
+	                            {
+	                                MediaUrl = url,
+	                                MediaType = detectedType.Value,
+	                                FileName = file.FileName,
+	                                FileSize = file.Length,
+	                                CreatedAt = now
+	                            });
+	                        }
+	                    }
+	                }
+	            }
+	            catch
+	            {
+	                await cleanupPlan.ExecuteRollbackAsync();
+	                throw;
+	            }
             
             // === database transaction phase ===
             return await _unitOfWork.ExecuteInTransactionAsync(
@@ -460,17 +478,7 @@ namespace CloudM.Application.Services.MessageServices
                     return result;
                 },
                 // cleanup callback: delete orphaned cloud media if db transaction fails
-                async () =>
-                {
-                    var cleanupTasks = uploadedMedia.Select(m =>
-                    {
-                        var publicId = _cloudinaryService.GetPublicIdFromUrl(m.url);
-                        return !string.IsNullOrEmpty(publicId) 
-                            ? _cloudinaryService.DeleteMediaAsync(publicId, m.type)
-                            : Task.CompletedTask;
-                    });
-                    await Task.WhenAll(cleanupTasks);
-                }
+                cleanupPlan.ExecuteRollbackAsync
             );
         }
 
@@ -514,6 +522,25 @@ namespace CloudM.Application.Services.MessageServices
                 };
             }
 
+            var conversation = await _conversationRepository.GetConversationByIdAsync(message.ConversationId);
+            if (conversation == null)
+                throw new NotFoundException("Conversation not found.");
+
+            if (!conversation.IsGroup)
+            {
+                var privateRelation = await GetBlockedRelationForPrivateConversationAsync(currentId, message.ConversationId);
+                if (privateRelation?.IsBlockedEitherWay == true)
+                    throw new BadRequestException("This conversation is unavailable.");
+            }
+
+            var messageMedias = await _messageMediaRepository.GetByMessageIdAsync(messageId) ?? new List<MessageMedia>();
+            var cleanupPlan = new CloudinaryCleanupPlan(_cloudinaryService);
+            foreach (var media in messageMedias)
+            {
+                cleanupPlan.AddPostCommitDeleteByUrl(media.MediaUrl, media.MediaType);
+                cleanupPlan.AddPostCommitDeleteByUrl(media.ThumbnailUrl, MediaTypeEnum.Image);
+            }
+
             message.IsRecalled = true;
             message.RecalledAt = DateTime.UtcNow;
 
@@ -550,6 +577,7 @@ namespace CloudM.Application.Services.MessageServices
             }
 
             await _unitOfWork.CommitAsync();
+            await cleanupPlan.ExecutePostCommitAsync();
 
             await _realtimeService.NotifyMessageRecalledAsync(
                 message.ConversationId,
@@ -577,12 +605,14 @@ namespace CloudM.Application.Services.MessageServices
 
             if (receiver == null)
                 throw new BadRequestException($"Receiver account with ID {request.ReceiverId} does not exist.");
-            if (receiver.Status != AccountStatusEnum.Active)
+            if (!SocialRoleRules.IsSocialEligible(receiver))
                 throw new BadRequestException("This user is currently unavailable.");
             if (sender == null)
                 throw new BadRequestException($"Sender account with ID {senderId} does not exist.");
-            if (sender.Status != AccountStatusEnum.Active)
+            if (!SocialRoleRules.IsSocialEligible(sender))
                 throw new ForbiddenException("You must reactivate your account to send messages.");
+            if (await _accountBlockRepository.IsBlockedEitherWayAsync(senderId, request.ReceiverId))
+                throw new BadRequestException("This user is currently unavailable.");
 
             var now = DateTime.UtcNow;
 
@@ -691,7 +721,7 @@ namespace CloudM.Application.Services.MessageServices
             var sender = await _accountRepository.GetAccountById(senderId);
             if (sender == null)
                 throw new BadRequestException($"Sender account with ID {senderId} does not exist.");
-            if (sender.Status != AccountStatusEnum.Active)
+            if (!SocialRoleRules.IsSocialEligible(sender))
                 throw new ForbiddenException("You must reactivate your account to send messages.");
 
             var normalizedKeyword = keyword?.Trim() ?? string.Empty;
@@ -710,6 +740,12 @@ namespace CloudM.Application.Services.MessageServices
 
                 var recentItems = new List<PostShareTargetSearchItemResponse>();
                 var uniqueKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                var recentPrivateOtherIds = recentConversations
+                    .Where(x => !x.IsGroup && x.OtherMember != null && x.OtherMember.AccountId != Guid.Empty)
+                    .Select(x => x.OtherMember!.AccountId)
+                    .Distinct()
+                    .ToList();
+                var recentPrivateRelationMap = await BuildBlockRelationMapAsync(senderId, recentPrivateOtherIds);
 
                 foreach (var conversation in recentConversations)
                 {
@@ -737,6 +773,12 @@ namespace CloudM.Application.Services.MessageServices
 
                     var otherMember = conversation.OtherMember;
                     if (otherMember == null || otherMember.AccountId == Guid.Empty)
+                    {
+                        continue;
+                    }
+
+                    if (recentPrivateRelationMap.TryGetValue(otherMember.AccountId, out var recentPrivateRelation) &&
+                        recentPrivateRelation.IsBlockedEitherWay)
                     {
                         continue;
                     }
@@ -851,7 +893,7 @@ namespace CloudM.Application.Services.MessageServices
             var sender = await _accountRepository.GetAccountById(senderId);
             if (sender == null)
                 throw new BadRequestException($"Sender account with ID {senderId} does not exist.");
-            if (sender.Status != AccountStatusEnum.Active)
+            if (!SocialRoleRules.IsSocialEligible(sender))
                 throw new ForbiddenException("You must reactivate your account to send messages.");
 
             var conversationIds = (request.ConversationIds ?? new List<Guid>())
@@ -892,10 +934,12 @@ namespace CloudM.Application.Services.MessageServices
             var processedConversationIds = new HashSet<Guid>();
             var results = new List<PostShareSendResult>();
             var receiverLookup = new Dictionary<Guid, Account>();
+            var receiverBlockRelationMap = new Dictionary<Guid, AccountBlockRelationModel>();
             if (receiverIds.Any())
             {
                 var receiverAccounts = await _accountRepository.GetAccountsByIds(receiverIds) ?? new List<Account>();
                 receiverLookup = receiverAccounts.ToDictionary(account => account.AccountId, account => account);
+                receiverBlockRelationMap = (await BuildBlockRelationMapAsync(senderId, receiverIds)).ToDictionary(x => x.Key, x => x.Value);
             }
 
             foreach (var conversationId in conversationIds)
@@ -944,7 +988,19 @@ namespace CloudM.Application.Services.MessageServices
                         continue;
                     }
 
-                    if (receiver.Status != AccountStatusEnum.Active)
+                    if (!SocialRoleRules.IsSocialEligible(receiver))
+                    {
+                        results.Add(new PostShareSendResult
+                        {
+                            ReceiverId = receiverId,
+                            IsSuccess = false,
+                            ErrorMessage = "This user is currently unavailable."
+                        });
+                        continue;
+                    }
+
+                    if (receiverBlockRelationMap.TryGetValue(receiverId, out var receiverRelation) &&
+                        receiverRelation.IsBlockedEitherWay)
                     {
                         results.Add(new PostShareSendResult
                         {
@@ -1013,7 +1069,7 @@ namespace CloudM.Application.Services.MessageServices
             var sender = await _accountRepository.GetAccountById(senderId);
             if (sender == null)
                 throw new BadRequestException($"Sender account with ID {senderId} does not exist.");
-            if (sender.Status != AccountStatusEnum.Active)
+            if (!SocialRoleRules.IsSocialEligible(sender))
                 throw new ForbiddenException("You must reactivate your account to send messages.");
 
             var conversationIds = (request.ConversationIds ?? new List<Guid>())
@@ -1081,11 +1137,13 @@ namespace CloudM.Application.Services.MessageServices
             var processedConversationIds = new HashSet<Guid>();
             var results = new List<PostShareSendResult>();
             var receiverLookup = new Dictionary<Guid, Account>();
+            var receiverBlockRelationMap = new Dictionary<Guid, AccountBlockRelationModel>();
 
             if (receiverIds.Any())
             {
                 var receiverAccounts = await _accountRepository.GetAccountsByIds(receiverIds) ?? new List<Account>();
                 receiverLookup = receiverAccounts.ToDictionary(account => account.AccountId, account => account);
+                receiverBlockRelationMap = (await BuildBlockRelationMapAsync(senderId, receiverIds)).ToDictionary(x => x.Key, x => x.Value);
             }
 
             foreach (var conversationId in conversationIds)
@@ -1134,7 +1192,19 @@ namespace CloudM.Application.Services.MessageServices
                         continue;
                     }
 
-                    if (receiver.Status != AccountStatusEnum.Active)
+                    if (!SocialRoleRules.IsSocialEligible(receiver))
+                    {
+                        results.Add(new PostShareSendResult
+                        {
+                            ReceiverId = receiverId,
+                            IsSuccess = false,
+                            ErrorMessage = "This user is currently unavailable."
+                        });
+                        continue;
+                    }
+
+                    if (receiverBlockRelationMap.TryGetValue(receiverId, out var receiverRelation) &&
+                        receiverRelation.IsBlockedEitherWay)
                     {
                         results.Add(new PostShareSendResult
                         {
@@ -1228,6 +1298,21 @@ namespace CloudM.Application.Services.MessageServices
                             ErrorMessage = "You are not a member of this conversation."
                         };
                     }
+
+                    if (!conversation.IsGroup)
+                    {
+                        var privateRelation = await GetBlockedRelationForPrivateConversationAsync(senderId, conversationId);
+                        if (privateRelation?.IsBlockedEitherWay == true)
+                        {
+                            return new PostShareSendResult
+                            {
+                                ConversationId = conversationId,
+                                ReceiverId = receiverId,
+                                IsSuccess = false,
+                                ErrorMessage = "This conversation is unavailable."
+                            };
+                        }
+                    }
                 }
 
                 var message = await _unitOfWork.ExecuteInTransactionAsync(
@@ -1315,6 +1400,21 @@ namespace CloudM.Application.Services.MessageServices
                             ErrorMessage = "You are not a member of this conversation."
                         };
                     }
+
+                    if (!conversation.IsGroup)
+                    {
+                        var privateRelation = await GetBlockedRelationForPrivateConversationAsync(senderId, conversationId);
+                        if (privateRelation?.IsBlockedEitherWay == true)
+                        {
+                            return new PostShareSendResult
+                            {
+                                ConversationId = conversationId,
+                                ReceiverId = receiverId,
+                                IsSuccess = false,
+                                ErrorMessage = "This conversation is unavailable."
+                            };
+                        }
+                    }
                 }
 
                 var message = await _unitOfWork.ExecuteInTransactionAsync(
@@ -1399,6 +1499,43 @@ namespace CloudM.Application.Services.MessageServices
             }
         }
 
+        private async Task<IReadOnlyDictionary<Guid, AccountBlockRelationModel>> BuildBlockRelationMapAsync(
+            Guid currentId,
+            IEnumerable<Guid> targetIds)
+        {
+            var safeTargetIds = (targetIds ?? Enumerable.Empty<Guid>())
+                .Where(x => x != Guid.Empty && x != currentId)
+                .Distinct()
+                .ToList();
+
+            if (safeTargetIds.Count == 0)
+            {
+                return new Dictionary<Guid, AccountBlockRelationModel>();
+            }
+
+            var relations = await _accountBlockRepository.GetRelationsAsync(currentId, safeTargetIds);
+            return relations.ToDictionary(x => x.TargetId, x => x);
+        }
+
+        private async Task<AccountBlockRelationModel?> GetBlockedRelationForPrivateConversationAsync(Guid currentId, Guid conversationId)
+        {
+            var memberIds = await _conversationMemberRepository.GetMemberIdsByConversationIdAsync(conversationId)
+                ?? new List<Guid>();
+            if (memberIds.Count == 0)
+            {
+                return null;
+            }
+
+            var otherId = memberIds.FirstOrDefault(x => x != currentId);
+            if (otherId == Guid.Empty)
+            {
+                return null;
+            }
+
+            return (await _accountBlockRepository.GetRelationsAsync(currentId, new[] { otherId }))
+                .FirstOrDefault();
+        }
+
         private static int NormalizePostShareSearchLimit(int? limit)
         {
             if (!limit.HasValue || limit.Value <= 0)
@@ -1466,7 +1603,7 @@ namespace CloudM.Application.Services.MessageServices
             }
 
             var activeCandidates = (mentionCandidates ?? Array.Empty<Account>())
-                .Where(account => account.Status == AccountStatusEnum.Active
+                .Where(account => SocialRoleRules.IsSocialEligible(account)
                                   && !string.IsNullOrWhiteSpace(account.Username))
                 .ToList();
 

@@ -1,0 +1,15 @@
+using System.ComponentModel.DataAnnotations;
+
+namespace CloudM.Application.DTOs.AuthDTOs
+{
+    public class ChangePasswordRequest
+    {
+        public string CurrentPassword { get; set; } = string.Empty;
+
+        [Required(ErrorMessage = "New password is required.")]
+        public string NewPassword { get; set; } = string.Empty;
+
+        [Required(ErrorMessage = "Confirm password is required.")]
+        public string ConfirmPassword { get; set; } = string.Empty;
+    }
+}

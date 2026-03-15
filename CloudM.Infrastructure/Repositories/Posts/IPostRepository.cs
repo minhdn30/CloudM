@@ -13,6 +13,7 @@ namespace CloudM.Infrastructure.Repositories.Posts
     {
         Task<Post?> GetPostById(Guid postId);
         Task<Post?> GetPostBasicInfoById(Guid postId);
+        Task<List<PostMedia>> GetPostMediasByPostIdAsync(Guid postId);
         Task<Post?> GetPostForUpdateContent(Guid postId);
         //main detail
         Task<PostDetailModel?> GetPostDetailByPostId(Guid postId, Guid currentId);
@@ -40,6 +41,7 @@ namespace CloudM.Infrastructure.Repositories.Posts
         Task RemovePostTagsAsync(Guid postId, IEnumerable<Guid> taggedAccountIds);
         Task<List<PostTaggedAccountModel>?> GetTaggedAccountsByPostIdAsync(Guid postId, Guid currentId);
         Task<List<PostFeedModel>> GetFeedByTimelineAsync(Guid currentId, DateTime? cursorCreatedAt, Guid? cursorPostId, int limit);
+        Task<List<PostFeedModel>> GetFeedPageAsync(Guid currentId, PostFeedCursorModel cursor, FeedRankingProfileModel rankingProfile, int limit);
         Task<List<PostFeedModel>> GetFeedByScoreAsync(Guid currentId, DateTime? cursorCreatedAt, Guid? cursorPostId, int limit);
     }
 }

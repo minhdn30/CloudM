@@ -575,6 +575,55 @@ namespace CloudM.API.Controllers
         }
 
         [Authorize]
+        [HttpGet("password-status")]
+        public async Task<IActionResult> GetPasswordStatus()
+        {
+            var accountId = User.GetAccountId();
+            if (accountId == null) return Unauthorized();
+
+            var result = await _authService.GetPasswordStatusAsync(accountId.Value);
+            return Ok(result);
+        }
+
+        [Authorize]
+        [HttpPost("change-password")]
+        public async Task<IActionResult> ChangePassword([FromBody] ChangePasswordRequest request)
+        {
+            var accountId = User.GetAccountId();
+            if (accountId == null) return Unauthorized();
+
+            if (request == null)
+            {
+                return BadRequest(new { message = "Request is required." });
+            }
+
+            var passwordValidationError = ValidatePasswordInput(request.NewPassword, request.ConfirmPassword);
+            if (passwordValidationError != null)
+            {
+                return passwordValidationError;
+            }
+
+            var result = await _authService.ChangePasswordAsync(
+                accountId.Value,
+                request.CurrentPassword,
+                request.NewPassword,
+                request.ConfirmPassword);
+            if (!string.IsNullOrEmpty(result.RefreshToken))
+            {
+                Response.Cookies.Append(
+                    "refreshToken",
+                    result.RefreshToken,
+                    BuildRefreshTokenCookieOptions(result.RefreshTokenExpiryTime));
+            }
+
+            return Ok(new
+            {
+                message = "Password updated successfully.",
+                result.AccessToken
+            });
+        }
+
+        [Authorize]
         [HttpPost("set-password")]
         public async Task<IActionResult> SetPassword([FromBody] SetPasswordRequest request)
         {

@@ -1,5 +1,6 @@
 using CloudM.Domain.Entities;
 using CloudM.Domain.Enums;
+using CloudM.Domain.Helpers;
 using CloudM.Infrastructure.Data;
 using Microsoft.EntityFrameworkCore;
 
@@ -84,13 +85,18 @@ namespace CloudM.Infrastructure.Repositories.Notifications
         {
             return await _context.NotificationContributions
                 .Include(x => x.Actor)
-                .Where(x => x.NotificationId == notificationId && x.IsActive)
+                .Where(x =>
+                    x.NotificationId == notificationId &&
+                    x.IsActive &&
+                    x.Actor.Status == AccountStatusEnum.Active &&
+                    SocialRoleRules.SocialEligibleRoleIds.Contains(x.Actor.RoleId))
                 .OrderByDescending(x => x.UpdatedAt)
                 .ToListAsync(cancellationToken);
         }
 
         public async Task<(List<Notification> Items, DateTime? NextCursorLastEventAt, Guid? NextCursorNotificationId)> GetByCursorAsync(
             Guid recipientId,
+            DateTime? lastNotificationsSeenAt,
             bool unreadOnly,
             int limit,
             DateTime? cursorLastEventAt,
@@ -105,9 +111,17 @@ namespace CloudM.Infrastructure.Repositories.Notifications
                     x.RecipientId == recipientId &&
                     x.Type != NotificationTypeEnum.FollowRequest);
 
-            if (unreadOnly)
+            if (unreadOnly && lastNotificationsSeenAt.HasValue)
             {
-                query = query.Where(x => !x.IsRead);
+                query = query.Where(x =>
+                    (x.Contributions.Any() &&
+                     x.Contributions.Any(c =>
+                         c.IsActive &&
+                         c.Actor.Status == AccountStatusEnum.Active &&
+                         SocialRoleRules.SocialEligibleRoleIds.Contains(c.Actor.RoleId) &&
+                         c.UpdatedAt > lastNotificationsSeenAt.Value)) ||
+                    (!x.Contributions.Any() &&
+                     x.LastEventAt > lastNotificationsSeenAt.Value));
             }
 
             if (cursorLastEventAt.HasValue && cursorNotificationId.HasValue)
@@ -138,16 +152,31 @@ namespace CloudM.Infrastructure.Repositories.Notifications
             return (items, nextCursorLastEventAt, nextCursorNotificationId);
         }
 
-        public async Task<int> GetUnreadCountAsync(Guid recipientId, CancellationToken cancellationToken = default)
+        public async Task<int> GetUnreadCountAsync(
+            Guid recipientId,
+            DateTime? lastNotificationsSeenAt,
+            CancellationToken cancellationToken = default)
         {
-            return await _context.Notifications
+            var query = _context.Notifications
                 .AsNoTracking()
-                .CountAsync(
-                    x =>
-                        x.RecipientId == recipientId &&
-                        !x.IsRead &&
-                        x.Type != NotificationTypeEnum.FollowRequest,
-                    cancellationToken);
+                .Where(x =>
+                    x.RecipientId == recipientId &&
+                    x.Type != NotificationTypeEnum.FollowRequest);
+
+            if (lastNotificationsSeenAt.HasValue)
+            {
+                query = query.Where(x =>
+                    (x.Contributions.Any() &&
+                     x.Contributions.Any(c =>
+                         c.IsActive &&
+                         c.Actor.Status == AccountStatusEnum.Active &&
+                         SocialRoleRules.SocialEligibleRoleIds.Contains(c.Actor.RoleId) &&
+                         c.UpdatedAt > lastNotificationsSeenAt.Value)) ||
+                    (!x.Contributions.Any() &&
+                     x.LastEventAt > lastNotificationsSeenAt.Value));
+            }
+
+            return await query.CountAsync(cancellationToken);
         }
 
         public async Task<List<Guid>> GetRecipientsByTargetAsync(

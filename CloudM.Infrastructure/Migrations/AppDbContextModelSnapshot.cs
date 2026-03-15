@@ -114,6 +114,60 @@ namespace CloudM.Infrastructure.Migrations
                     b.ToTable("Accounts");
                 });
 
+            modelBuilder.Entity("CloudM.Domain.Entities.AccountBlock", b =>
+                {
+                    b.Property<Guid>("BlockerId")
+                        .HasColumnType("uuid");
+
+                    b.Property<Guid>("BlockedId")
+                        .HasColumnType("uuid");
+
+                    b.Property<string>("BlockedSnapshotUsername")
+                        .HasMaxLength(100)
+                        .HasColumnType("character varying(100)");
+
+                    b.Property<string>("BlockerSnapshotUsername")
+                        .HasMaxLength(100)
+                        .HasColumnType("character varying(100)");
+
+                    b.Property<DateTime>("CreatedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.HasKey("BlockerId", "BlockedId");
+
+                    b.HasIndex("BlockedId", "CreatedAt")
+                        .HasDatabaseName("IX_AccountBlocks_Blocked_CreatedAt");
+
+                    b.HasIndex("BlockerId", "CreatedAt")
+                        .HasDatabaseName("IX_AccountBlocks_Blocker_CreatedAt");
+
+                    b.ToTable("AccountBlocks");
+                });
+
+            modelBuilder.Entity("CloudM.Domain.Entities.AccountSearchHistory", b =>
+                {
+                    b.Property<Guid>("CurrentId")
+                        .HasColumnType("uuid");
+
+                    b.Property<Guid>("TargetId")
+                        .HasColumnType("uuid");
+
+                    b.Property<DateTime>("CreatedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<DateTime>("LastSearchedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.HasKey("CurrentId", "TargetId");
+
+                    b.HasIndex("TargetId");
+
+                    b.HasIndex("CurrentId", "LastSearchedAt")
+                        .HasDatabaseName("IX_AccountSearchHistories_Current_LastSearchedAt");
+
+                    b.ToTable("AccountSearchHistories");
+                });
+
             modelBuilder.Entity("CloudM.Domain.Entities.AccountSettings", b =>
                 {
                     b.Property<Guid>("AccountId")
@@ -147,6 +201,9 @@ namespace CloudM.Infrastructure.Migrations
                     b.Property<int>("PhonePrivacy")
                         .HasColumnType("integer");
 
+                    b.Property<bool>("SoundEffectsEnabled")
+                        .HasColumnType("boolean");
+
                     b.Property<int>("StoryHighlightPrivacy")
                         .HasColumnType("integer");
 
@@ -156,6 +213,59 @@ namespace CloudM.Infrastructure.Migrations
                     b.HasKey("AccountId");
 
                     b.ToTable("AccountSettings");
+                });
+
+            modelBuilder.Entity("CloudM.Domain.Entities.AdminAuditLog", b =>
+                {
+                    b.Property<Guid>("AdminAuditLogId")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("uuid");
+
+                    b.Property<string>("ActionType")
+                        .IsRequired()
+                        .HasMaxLength(100)
+                        .HasColumnType("varchar(100)");
+
+                    b.Property<Guid>("AdminId")
+                        .HasColumnType("uuid");
+
+                    b.Property<DateTime>("CreatedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("Module")
+                        .IsRequired()
+                        .HasMaxLength(100)
+                        .HasColumnType("varchar(100)");
+
+                    b.Property<string>("RequestIp")
+                        .HasMaxLength(64)
+                        .HasColumnType("varchar(64)");
+
+                    b.Property<string>("Summary")
+                        .IsRequired()
+                        .HasMaxLength(300)
+                        .HasColumnType("varchar(300)");
+
+                    b.Property<string>("TargetId")
+                        .HasMaxLength(100)
+                        .HasColumnType("varchar(100)");
+
+                    b.Property<string>("TargetType")
+                        .HasMaxLength(100)
+                        .HasColumnType("varchar(100)");
+
+                    b.HasKey("AdminAuditLogId");
+
+                    b.HasIndex("AdminId", "CreatedAt")
+                        .HasDatabaseName("IX_AdminAuditLogs_AdminId_CreatedAt");
+
+                    b.HasIndex("CreatedAt", "AdminAuditLogId")
+                        .HasDatabaseName("IX_AdminAuditLogs_CreatedAt_AdminAuditLogId");
+
+                    b.HasIndex("Module", "ActionType", "CreatedAt")
+                        .HasDatabaseName("IX_AdminAuditLogs_Module_ActionType_CreatedAt");
+
+                    b.ToTable("AdminAuditLogs");
                 });
 
             modelBuilder.Entity("CloudM.Domain.Entities.Comment", b =>
@@ -189,13 +299,16 @@ namespace CloudM.Infrastructure.Migrations
                     b.HasIndex("AccountId")
                         .HasDatabaseName("IX_Comment_AccountId");
 
-                    b.HasIndex("ParentCommentId", "CreatedAt")
+                    b.HasIndex("AccountId", "CreatedAt", "PostId")
+                        .HasDatabaseName("IX_Comment_Account_CreatedAt_PostId");
+
+                    b.HasIndex("ParentCommentId", "CreatedAt", "CommentId")
                         .HasDatabaseName("IX_Comment_Parent_Created");
 
                     b.HasIndex("PostId", "AccountId", "CreatedAt")
                         .HasDatabaseName("IX_Comment_Post_Account_Created");
 
-                    b.HasIndex("PostId", "ParentCommentId", "CreatedAt")
+                    b.HasIndex("PostId", "ParentCommentId", "CreatedAt", "CommentId")
                         .HasDatabaseName("IX_Comment_Post_Parent_Created");
 
                     b.ToTable("Comments");
@@ -260,8 +373,6 @@ namespace CloudM.Infrastructure.Migrations
 
                     NpgsqlIndexBuilderExtensions.HasMethod(b.HasIndex("ConversationName"), "GIN");
                     NpgsqlIndexBuilderExtensions.HasOperators(b.HasIndex("ConversationName"), new[] { "gin_trgm_ops" });
-
-                    b.HasIndex("CreatedAt");
 
                     b.HasIndex("CreatedBy");
 
@@ -592,6 +703,110 @@ namespace CloudM.Infrastructure.Migrations
                     b.ToTable("MessageReacts");
                 });
 
+            modelBuilder.Entity("CloudM.Domain.Entities.ModerationReport", b =>
+                {
+                    b.Property<Guid>("ModerationReportId")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("uuid");
+
+                    b.Property<DateTime>("CreatedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<Guid?>("CreatedByAdminId")
+                        .HasColumnType("uuid");
+
+                    b.Property<string>("Detail")
+                        .HasMaxLength(1000)
+                        .HasColumnType("varchar(1000)");
+
+                    b.Property<string>("ReasonCode")
+                        .IsRequired()
+                        .HasMaxLength(100)
+                        .HasColumnType("varchar(100)");
+
+                    b.Property<Guid?>("ReporterAccountId")
+                        .HasColumnType("uuid");
+
+                    b.Property<DateTime?>("ResolvedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<Guid?>("ResolvedByAdminId")
+                        .HasColumnType("uuid");
+
+                    b.Property<int>("SourceType")
+                        .HasColumnType("integer");
+
+                    b.Property<int>("Status")
+                        .HasColumnType("integer");
+
+                    b.Property<Guid>("TargetId")
+                        .HasColumnType("uuid");
+
+                    b.Property<int>("TargetType")
+                        .HasColumnType("integer");
+
+                    b.Property<DateTime?>("UpdatedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.HasKey("ModerationReportId");
+
+                    b.HasIndex("CreatedByAdminId");
+
+                    b.HasIndex("ResolvedByAdminId");
+
+                    b.HasIndex("ReporterAccountId", "TargetType", "TargetId")
+                        .IsUnique()
+                        .HasDatabaseName("IX_ModerationReports_UserSubmittedPendingUnique")
+                        .HasFilter("\"ReporterAccountId\" IS NOT NULL AND \"SourceType\" = 1 AND \"Status\" IN (0, 1)");
+
+                    b.HasIndex("Status", "CreatedAt", "ModerationReportId")
+                        .HasDatabaseName("IX_ModerationReports_Status_CreatedAt_ReportId");
+
+                    b.HasIndex("TargetType", "TargetId", "CreatedAt")
+                        .HasDatabaseName("IX_ModerationReports_TargetType_TargetId_CreatedAt");
+
+                    b.ToTable("ModerationReports");
+                });
+
+            modelBuilder.Entity("CloudM.Domain.Entities.ModerationReportAction", b =>
+                {
+                    b.Property<Guid>("ModerationReportActionId")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("uuid");
+
+                    b.Property<int>("ActionType")
+                        .HasColumnType("integer");
+
+                    b.Property<Guid>("AdminId")
+                        .HasColumnType("uuid");
+
+                    b.Property<DateTime>("CreatedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<int?>("FromStatus")
+                        .HasColumnType("integer");
+
+                    b.Property<Guid>("ModerationReportId")
+                        .HasColumnType("uuid");
+
+                    b.Property<string>("Note")
+                        .HasMaxLength(1000)
+                        .HasColumnType("varchar(1000)");
+
+                    b.Property<int?>("ToStatus")
+                        .HasColumnType("integer");
+
+                    b.HasKey("ModerationReportActionId");
+
+                    b.HasIndex("AdminId", "CreatedAt")
+                        .HasDatabaseName("IX_ModerationReportActions_AdminId_CreatedAt");
+
+                    b.HasIndex("ModerationReportId", "CreatedAt")
+                        .HasDatabaseName("IX_ModerationReportActions_ReportId_CreatedAt");
+
+                    b.ToTable("ModerationReportActions");
+                });
+
             modelBuilder.Entity("CloudM.Domain.Entities.Notification", b =>
                 {
                     b.Property<Guid>("NotificationId")
@@ -611,9 +826,6 @@ namespace CloudM.Infrastructure.Migrations
 
                     b.Property<int>("EventCount")
                         .HasColumnType("integer");
-
-                    b.Property<bool>("IsRead")
-                        .HasColumnType("boolean");
 
                     b.Property<Guid?>("LastActorId")
                         .HasColumnType("uuid");
@@ -655,9 +867,6 @@ namespace CloudM.Infrastructure.Migrations
                     b.HasIndex("RecipientId", "Type", "AggregateKey")
                         .IsUnique()
                         .HasDatabaseName("IX_Notifications_Recipient_Type_Aggregate_Unique");
-
-                    b.HasIndex("RecipientId", "IsRead", "LastEventAt", "NotificationId")
-                        .HasDatabaseName("IX_Notifications_Recipient_IsRead_LastEventAt_NotificationId");
 
                     b.ToTable("Notifications");
                 });
@@ -754,6 +963,28 @@ namespace CloudM.Infrastructure.Migrations
                         .HasDatabaseName("IX_NotificationOutbox_Status_NextRetryAt_OccurredAt");
 
                     b.ToTable("NotificationOutboxes");
+                });
+
+            modelBuilder.Entity("CloudM.Domain.Entities.NotificationReadState", b =>
+                {
+                    b.Property<Guid>("AccountId")
+                        .HasColumnType("uuid");
+
+                    b.Property<DateTime>("CreatedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<DateTime?>("LastFollowRequestsSeenAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<DateTime?>("LastNotificationsSeenAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<DateTime>("UpdatedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.HasKey("AccountId");
+
+                    b.ToTable("NotificationReadStates");
                 });
 
             modelBuilder.Entity("CloudM.Domain.Entities.PinnedMessage", b =>
@@ -871,7 +1102,11 @@ namespace CloudM.Infrastructure.Migrations
 
                     b.HasKey("PostId", "AccountId");
 
-                    b.HasIndex("AccountId");
+                    b.HasIndex("PostId", "CreatedAt")
+                        .HasDatabaseName("IX_PostReacts_Post_CreatedAt");
+
+                    b.HasIndex("AccountId", "CreatedAt", "PostId")
+                        .HasDatabaseName("IX_PostReacts_Account_CreatedAt_PostId");
 
                     b.ToTable("PostReacts");
                 });
@@ -1110,6 +1345,44 @@ namespace CloudM.Infrastructure.Migrations
                     b.Navigation("Role");
                 });
 
+            modelBuilder.Entity("CloudM.Domain.Entities.AccountBlock", b =>
+                {
+                    b.HasOne("CloudM.Domain.Entities.Account", "Blocked")
+                        .WithMany("BlocksReceived")
+                        .HasForeignKey("BlockedId")
+                        .OnDelete(DeleteBehavior.NoAction)
+                        .IsRequired();
+
+                    b.HasOne("CloudM.Domain.Entities.Account", "Blocker")
+                        .WithMany("BlocksInitiated")
+                        .HasForeignKey("BlockerId")
+                        .OnDelete(DeleteBehavior.NoAction)
+                        .IsRequired();
+
+                    b.Navigation("Blocked");
+
+                    b.Navigation("Blocker");
+                });
+
+            modelBuilder.Entity("CloudM.Domain.Entities.AccountSearchHistory", b =>
+                {
+                    b.HasOne("CloudM.Domain.Entities.Account", "Current")
+                        .WithMany()
+                        .HasForeignKey("CurrentId")
+                        .OnDelete(DeleteBehavior.NoAction)
+                        .IsRequired();
+
+                    b.HasOne("CloudM.Domain.Entities.Account", "Target")
+                        .WithMany()
+                        .HasForeignKey("TargetId")
+                        .OnDelete(DeleteBehavior.NoAction)
+                        .IsRequired();
+
+                    b.Navigation("Current");
+
+                    b.Navigation("Target");
+                });
+
             modelBuilder.Entity("CloudM.Domain.Entities.AccountSettings", b =>
                 {
                     b.HasOne("CloudM.Domain.Entities.Account", "Account")
@@ -1119,6 +1392,17 @@ namespace CloudM.Infrastructure.Migrations
                         .IsRequired();
 
                     b.Navigation("Account");
+                });
+
+            modelBuilder.Entity("CloudM.Domain.Entities.AdminAuditLog", b =>
+                {
+                    b.HasOne("CloudM.Domain.Entities.Account", "Admin")
+                        .WithMany()
+                        .HasForeignKey("AdminId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.Navigation("Admin");
                 });
 
             modelBuilder.Entity("CloudM.Domain.Entities.Comment", b =>
@@ -1327,6 +1611,49 @@ namespace CloudM.Infrastructure.Migrations
                     b.Navigation("Message");
                 });
 
+            modelBuilder.Entity("CloudM.Domain.Entities.ModerationReport", b =>
+                {
+                    b.HasOne("CloudM.Domain.Entities.Account", "CreatedByAdmin")
+                        .WithMany()
+                        .HasForeignKey("CreatedByAdminId")
+                        .OnDelete(DeleteBehavior.SetNull);
+
+                    b.HasOne("CloudM.Domain.Entities.Account", "ReporterAccount")
+                        .WithMany()
+                        .HasForeignKey("ReporterAccountId")
+                        .OnDelete(DeleteBehavior.SetNull);
+
+                    b.HasOne("CloudM.Domain.Entities.Account", "ResolvedByAdmin")
+                        .WithMany()
+                        .HasForeignKey("ResolvedByAdminId")
+                        .OnDelete(DeleteBehavior.SetNull);
+
+                    b.Navigation("CreatedByAdmin");
+
+                    b.Navigation("ReporterAccount");
+
+                    b.Navigation("ResolvedByAdmin");
+                });
+
+            modelBuilder.Entity("CloudM.Domain.Entities.ModerationReportAction", b =>
+                {
+                    b.HasOne("CloudM.Domain.Entities.Account", "Admin")
+                        .WithMany()
+                        .HasForeignKey("AdminId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.HasOne("CloudM.Domain.Entities.ModerationReport", "Report")
+                        .WithMany("Actions")
+                        .HasForeignKey("ModerationReportId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.Navigation("Admin");
+
+                    b.Navigation("Report");
+                });
+
             modelBuilder.Entity("CloudM.Domain.Entities.Notification", b =>
                 {
                     b.HasOne("CloudM.Domain.Entities.Account", "Recipient")
@@ -1366,6 +1693,17 @@ namespace CloudM.Infrastructure.Migrations
                         .IsRequired();
 
                     b.Navigation("Recipient");
+                });
+
+            modelBuilder.Entity("CloudM.Domain.Entities.NotificationReadState", b =>
+                {
+                    b.HasOne("CloudM.Domain.Entities.Account", "Account")
+                        .WithOne("NotificationReadState")
+                        .HasForeignKey("CloudM.Domain.Entities.NotificationReadState", "AccountId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.Navigation("Account");
                 });
 
             modelBuilder.Entity("CloudM.Domain.Entities.PinnedMessage", b =>
@@ -1536,6 +1874,10 @@ namespace CloudM.Infrastructure.Migrations
 
             modelBuilder.Entity("CloudM.Domain.Entities.Account", b =>
                 {
+                    b.Navigation("BlocksInitiated");
+
+                    b.Navigation("BlocksReceived");
+
                     b.Navigation("CommentReacts");
 
                     b.Navigation("Comments");
@@ -1555,6 +1897,8 @@ namespace CloudM.Infrastructure.Migrations
                     b.Navigation("Followings");
 
                     b.Navigation("Messages");
+
+                    b.Navigation("NotificationReadState");
 
                     b.Navigation("OwnedConversations");
 
@@ -1597,6 +1941,11 @@ namespace CloudM.Infrastructure.Migrations
                     b.Navigation("Medias");
 
                     b.Navigation("Reacts");
+                });
+
+            modelBuilder.Entity("CloudM.Domain.Entities.ModerationReport", b =>
+                {
+                    b.Navigation("Actions");
                 });
 
             modelBuilder.Entity("CloudM.Domain.Entities.Notification", b =>

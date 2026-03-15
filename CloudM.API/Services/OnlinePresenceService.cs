@@ -4,6 +4,7 @@ using CloudM.API.Hubs;
 using CloudM.Application.DTOs.PresenceDTOs;
 using CloudM.Application.Services.PresenceServices;
 using CloudM.Domain.Enums;
+using CloudM.Infrastructure.Repositories.AccountBlocks;
 using CloudM.Infrastructure.Repositories.Presences;
 using StackExchange.Redis;
 
@@ -12,8 +13,11 @@ namespace CloudM.API.Services
     public class OnlinePresenceService : IOnlinePresenceService
     {
         private readonly IConnectionMultiplexer _redis;
+        private readonly IAccountBlockRepository _accountBlockRepository;
         private readonly IOnlinePresenceRepository _onlinePresenceRepository;
         private readonly IHubContext<UserHub> _userHubContext;
+        private readonly MemoryPresenceSnapshotRateLimiter _memorySnapshotRateLimiter;
+        private readonly MemoryPresenceHiddenBroadcastTracker _hiddenBroadcastTracker;
         private readonly OnlinePresenceOptions _options;
         private readonly string _keyPrefix;
         private readonly ILogger<OnlinePresenceService> _logger;
@@ -21,18 +25,25 @@ namespace CloudM.API.Services
         private readonly TimeSpan _connectionOwnerTtl;
         private readonly TimeSpan _offlineLockTtl;
         private readonly TimeSpan _lastDisconnectTtl;
+        private readonly TimeSpan _fallbackHiddenBroadcastTtl;
 
         public OnlinePresenceService(
             IConnectionMultiplexer redis,
+            IAccountBlockRepository accountBlockRepository,
             IOnlinePresenceRepository onlinePresenceRepository,
             IHubContext<UserHub> userHubContext,
+            MemoryPresenceSnapshotRateLimiter memorySnapshotRateLimiter,
+            MemoryPresenceHiddenBroadcastTracker hiddenBroadcastTracker,
             IOptions<OnlinePresenceOptions> options,
             IConfiguration configuration,
             ILogger<OnlinePresenceService> logger)
         {
             _redis = redis;
+            _accountBlockRepository = accountBlockRepository;
             _onlinePresenceRepository = onlinePresenceRepository;
             _userHubContext = userHubContext;
+            _memorySnapshotRateLimiter = memorySnapshotRateLimiter;
+            _hiddenBroadcastTracker = hiddenBroadcastTracker;
             _options = (options.Value ?? new OnlinePresenceOptions()).Normalize();
             _keyPrefix = (configuration["Redis:KeyPrefix"] ?? "cloudm").Trim();
             _logger = logger;
@@ -41,6 +52,7 @@ namespace CloudM.API.Services
             _connectionOwnerTtl = TimeSpan.FromSeconds(Math.Max(_options.HeartbeatTtlSeconds * 3, 180));
             _offlineLockTtl = TimeSpan.FromSeconds(Math.Max(5, _options.OfflineLockSeconds));
             _lastDisconnectTtl = TimeSpan.FromHours(30);
+            _fallbackHiddenBroadcastTtl = TimeSpan.FromSeconds(Math.Max(30, _options.HeartbeatTtlSeconds));
         }
 
         public async Task MarkConnectedAsync(Guid accountId, string connectionId, DateTime nowUtc, CancellationToken cancellationToken = default)
@@ -64,10 +76,13 @@ namespace CloudM.API.Services
                 {
                     await BroadcastOnlineAsync(accountId, nowUtc, cancellationToken);
                 }
+
+                ClearFallbackHiddenBroadcast(accountId);
             }
             catch (RedisException ex)
             {
                 _logger.LogWarning(ex, "Presence connect update failed for {AccountId}.", accountId);
+                await TryBroadcastHiddenFallbackAsync(accountId, cancellationToken);
             }
         }
 
@@ -108,6 +123,7 @@ namespace CloudM.API.Services
                     await database.KeyExpireAsync(countKey, _countTtl);
                     await database.SortedSetRemoveAsync(BuildOfflineCandidatesKey(), BuildOfflineCandidateMember(targetAccountId));
                     await database.KeyDeleteAsync(BuildPendingOfflineKey(targetAccountId));
+                    ClearFallbackHiddenBroadcast(targetAccountId);
                     return;
                 }
 
@@ -137,10 +153,15 @@ namespace CloudM.API.Services
                     BuildOfflineCandidatesKey(),
                     BuildOfflineCandidateMember(targetAccountId),
                     dueAtUnixSeconds);
+                ClearFallbackHiddenBroadcast(targetAccountId);
             }
             catch (RedisException ex)
             {
                 _logger.LogWarning(ex, "Presence disconnect update failed for {ConnectionId}.", connectionId);
+                if (accountId.HasValue && accountId.Value != Guid.Empty)
+                {
+                    await TryBroadcastHiddenFallbackAsync(accountId.Value, cancellationToken);
+                }
             }
         }
 
@@ -170,10 +191,12 @@ namespace CloudM.API.Services
 
                 await database.SortedSetRemoveAsync(BuildOfflineCandidatesKey(), BuildOfflineCandidateMember(accountId));
                 await database.KeyDeleteAsync(BuildPendingOfflineKey(accountId));
+                ClearFallbackHiddenBroadcast(accountId);
             }
             catch (RedisException ex)
             {
                 _logger.LogWarning(ex, "Presence heartbeat failed for {AccountId}.", accountId);
+                await TryBroadcastHiddenFallbackAsync(accountId, cancellationToken);
             }
         }
 
@@ -213,11 +236,16 @@ namespace CloudM.API.Services
                     : windowSeconds;
                 return (false, retryAfterSeconds);
             }
-            catch (RedisException ex)
+            catch (Exception ex) when (IsRedisRateLimitFailure(ex))
             {
-                _logger.LogWarning(ex, "Presence snapshot rate-limit check failed open for {AccountId}.", viewerAccountId);
-                return (true, 0);
+                _logger.LogWarning(ex, "Presence snapshot rate-limit check fell back to memory for {AccountId}.", viewerAccountId);
+                return _memorySnapshotRateLimiter.TryConsume(viewerAccountId, nowUtc);
             }
+        }
+
+        private static bool IsRedisRateLimitFailure(Exception ex)
+        {
+            return ex is RedisException || ex is RedisTimeoutException;
         }
 
         public async Task<PresenceSnapshotResponse> GetSnapshotAsync(
@@ -236,23 +264,44 @@ namespace CloudM.API.Services
                 return new PresenceSnapshotResponse();
             }
 
+            var (livePresenceMap, redisAvailable) = await GetLivePresenceMapAsync(normalizedAccountIds);
+            if (!redisAvailable)
+            {
+                return BuildUnavailableSnapshotResponse(normalizedAccountIds);
+            }
+
             var accountStates = await _onlinePresenceRepository.GetSnapshotAccountStatesAsync(
                 normalizedAccountIds,
                 cancellationToken);
 
             var stateMap = accountStates.ToDictionary(x => x.AccountId);
+            var blockedTargetIds = await GetBlockedTargetIdsAsync(
+                viewerAccountId,
+                normalizedAccountIds,
+                cancellationToken);
 
             var contactSet = await _onlinePresenceRepository.GetContactTargetIdsAsync(
                 viewerAccountId,
                 normalizedAccountIds,
                 cancellationToken);
 
-            var livePresenceMap = await GetLivePresenceMapAsync(accountStates.Select(x => x.AccountId).ToList());
             var oneDay = TimeSpan.FromDays(1);
             var items = new List<PresenceSnapshotItemResponse>(normalizedAccountIds.Count);
 
             foreach (var accountId in normalizedAccountIds)
             {
+                if (blockedTargetIds.Contains(accountId))
+                {
+                    items.Add(new PresenceSnapshotItemResponse
+                    {
+                        AccountId = accountId,
+                        CanShowStatus = false,
+                        IsOnline = false,
+                        LastOnlineAt = null
+                    });
+                    continue;
+                }
+
                 if (!stateMap.TryGetValue(accountId, out var state))
                 {
                     items.Add(new PresenceSnapshotItemResponse
@@ -318,6 +367,29 @@ namespace CloudM.API.Services
             return new PresenceSnapshotResponse { Items = items };
         }
 
+        public async Task NotifyBlockedPairHiddenAsync(
+            Guid currentId,
+            Guid targetId,
+            CancellationToken cancellationToken = default)
+        {
+            if (currentId == Guid.Empty || targetId == Guid.Empty || currentId == targetId)
+            {
+                return;
+            }
+
+            await _userHubContext.Clients.Users(new[] { currentId.ToString("D") })
+                .SendAsync("UserPresenceHidden", new
+                {
+                    AccountId = targetId
+                }, cancellationToken);
+
+            await _userHubContext.Clients.Users(new[] { targetId.ToString("D") })
+                .SendAsync("UserPresenceHidden", new
+                {
+                    AccountId = currentId
+                }, cancellationToken);
+        }
+
         public async Task NotifyVisibilityChangedAsync(
             Guid accountId,
             OnlineStatusVisibilityEnum previousVisibility,
@@ -357,6 +429,11 @@ namespace CloudM.API.Services
                 }
 
                 await BroadcastHiddenAsync(accountId, cancellationToken);
+            }
+            catch (RedisException ex)
+            {
+                _logger.LogWarning(ex, "Presence visibility-change broadcast failed for {AccountId}. Falling back to hidden state.", accountId);
+                await TryBroadcastHiddenFallbackAsync(accountId, cancellationToken);
             }
             catch (Exception ex)
             {
@@ -530,13 +607,13 @@ namespace CloudM.API.Services
             return accountLastOnlineMap.Count;
         }
 
-        private async Task<Dictionary<Guid, (bool IsOnline, DateTime? LastOnlineAtUtc)>> GetLivePresenceMapAsync(
+        private async Task<(Dictionary<Guid, (bool IsOnline, DateTime? LastOnlineAtUtc)> Map, bool RedisAvailable)> GetLivePresenceMapAsync(
             IReadOnlyCollection<Guid> accountIds)
         {
             var result = accountIds.ToDictionary(id => id, _ => (false, (DateTime?)null));
             if (accountIds.Count == 0)
             {
-                return result;
+                return (result, true);
             }
 
             var database = _redis.GetDatabase();
@@ -563,7 +640,7 @@ namespace CloudM.API.Services
 
                 if (offlineAccountIds.Count == 0)
                 {
-                    return result;
+                    return (result, true);
                 }
 
                 var pendingTasks = offlineAccountIds
@@ -585,7 +662,7 @@ namespace CloudM.API.Services
 
                 if (nonPendingAccountIds.Count == 0)
                 {
-                    return result;
+                    return (result, true);
                 }
 
                 var disconnectTasks = nonPendingAccountIds
@@ -601,10 +678,74 @@ namespace CloudM.API.Services
             }
             catch (RedisException ex)
             {
-                _logger.LogWarning(ex, "Presence live-state lookup failed. Falling back to cached state.");
+                _logger.LogWarning(ex, "Presence live-state lookup failed. Falling back to hidden state.");
+                return (result, false);
             }
 
-            return result;
+            return (result, true);
+        }
+
+        private PresenceSnapshotResponse BuildUnavailableSnapshotResponse(IReadOnlyCollection<Guid> accountIds)
+        {
+            return new PresenceSnapshotResponse
+            {
+                Items = accountIds
+                    .Select(accountId => new PresenceSnapshotItemResponse
+                    {
+                        AccountId = accountId,
+                        CanShowStatus = false,
+                        IsOnline = false,
+                        LastOnlineAt = null
+                    })
+                    .ToList()
+            };
+        }
+
+        private async Task<HashSet<Guid>> GetBlockedTargetIdsAsync(
+            Guid currentId,
+            IReadOnlyCollection<Guid> targetIds,
+            CancellationToken cancellationToken = default)
+        {
+            if (currentId == Guid.Empty || targetIds.Count == 0)
+            {
+                return new HashSet<Guid>();
+            }
+
+            var relations = await _accountBlockRepository.GetRelationsAsync(
+                currentId,
+                targetIds,
+                cancellationToken);
+
+            return relations
+                .Where(x => x.IsBlockedEitherWay)
+                .Select(x => x.TargetId)
+                .ToHashSet();
+        }
+
+        private async Task<List<Guid>> FilterAudienceByBlockAsync(
+            Guid accountId,
+            List<Guid> audienceAccountIds,
+            CancellationToken cancellationToken = default)
+        {
+            if (accountId == Guid.Empty || audienceAccountIds.Count == 0)
+            {
+                return audienceAccountIds;
+            }
+
+            var blockedTargetIds = await GetBlockedTargetIdsAsync(
+                accountId,
+                audienceAccountIds,
+                cancellationToken);
+
+            if (blockedTargetIds.Count == 0)
+            {
+                return audienceAccountIds;
+            }
+
+            return audienceAccountIds
+                .Where(x => !blockedTargetIds.Contains(x))
+                .Distinct()
+                .ToList();
         }
 
         private async Task<long> ReadOnlineCountAsync(IDatabase database, Guid accountId)
@@ -688,6 +829,7 @@ namespace CloudM.API.Services
             }
 
             var audience = await _onlinePresenceRepository.GetAudienceAccountIdsAsync(accountId, cancellationToken);
+            audience = await FilterAudienceByBlockAsync(accountId, audience, cancellationToken);
             if (audience.Count == 0)
             {
                 return;
@@ -711,6 +853,7 @@ namespace CloudM.API.Services
             }
 
             var audience = await _onlinePresenceRepository.GetAudienceAccountIdsAsync(accountId, cancellationToken);
+            audience = await FilterAudienceByBlockAsync(accountId, audience, cancellationToken);
             if (audience.Count == 0)
             {
                 return;
@@ -727,6 +870,7 @@ namespace CloudM.API.Services
         private async Task BroadcastHiddenAsync(Guid accountId, CancellationToken cancellationToken)
         {
             var audience = await _onlinePresenceRepository.GetAudienceAccountIdsAsync(accountId, cancellationToken);
+            audience = await FilterAudienceByBlockAsync(accountId, audience, cancellationToken);
             if (audience.Count == 0)
             {
                 return;
@@ -737,6 +881,38 @@ namespace CloudM.API.Services
                 {
                     AccountId = accountId
                 }, cancellationToken);
+        }
+
+        private async Task TryBroadcastHiddenFallbackAsync(Guid accountId, CancellationToken cancellationToken)
+        {
+            if (accountId == Guid.Empty || !TryAcquireFallbackHiddenBroadcast(accountId))
+            {
+                return;
+            }
+
+            try
+            {
+                await BroadcastHiddenAsync(accountId, cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Presence hidden fallback broadcast failed for {AccountId}.", accountId);
+            }
+        }
+
+        private bool TryAcquireFallbackHiddenBroadcast(Guid accountId)
+        {
+            return _hiddenBroadcastTracker.TryAcquire(accountId, _fallbackHiddenBroadcastTtl);
+        }
+
+        private void ClearFallbackHiddenBroadcast(Guid accountId)
+        {
+            if (accountId == Guid.Empty)
+            {
+                return;
+            }
+
+            _hiddenBroadcastTracker.Clear(accountId);
         }
 
         private DateTime ResolveCandidateLastOnlineAtUtc(double dueAtScore, DateTime nowUtc)
@@ -825,5 +1001,6 @@ namespace CloudM.API.Services
         {
             return $"{_keyPrefix}:presence:snapshot:rl:{accountId:D}:w:{bucket}";
         }
+
     }
 }

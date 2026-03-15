@@ -35,5 +35,4 @@ jobs:
         run: |
           set -euo pipefail
           cd /opt/cloudm/backend
-          chmod +x scripts/deploy-production.sh
-          DEPLOY_BRANCH=main ./scripts/deploy-production.sh
+          DEPLOY_BRANCH=main bash scripts/deploy-production.sh

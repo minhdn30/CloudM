@@ -19,6 +19,7 @@ namespace CloudM.Application.Services.AuthServices
 {
     public class AuthService : IAuthService
     {
+        // trigger ci cd runner test
         private const int PasswordMinLength = 6;
         private const int MaxFullNameLength = 100;
         private const int ExternalProfileFullNameMaxLength = 25;

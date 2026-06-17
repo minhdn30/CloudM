@@ -93,7 +93,7 @@ namespace CloudM.Tests.Services
             // Assert
             result.Should().NotBeNull();
             result.AccountId.Should().Be(account.AccountId);
-            account.Status.Should().Be(AccountStatusEnum.EmailNotVerified);
+            account.Status.Should().Be(AccountStatusEnum.Active);
             account.Settings.Should().NotBeNull();
             _accountRepositoryMock.Verify(x => x.AddAccount(It.IsAny<Account>()), Times.Once);
             _unitOfWorkMock.Verify(x => x.CommitAsync(), Times.Once);
